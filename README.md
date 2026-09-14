@@ -37,7 +37,7 @@ When moving from linear-pi-agent, configure the T3Code connection and project ro
 - A public HTTPS address, through a reverse proxy or tunnel, forwarding to the bridge's localhost listener.
 - The bridge and T3Code must see the same repository, worktree and context files at the same absolute paths. Running them on the same host is the simplest arrangement. A remote T3Code host needs shared files at identical paths; the bridge does not transfer checkouts.
 
-Live end-to-end acceptance is still in progress. See [the acceptance record](docs/acceptance/nor-173.md) for completed checks and outstanding validation before relying on this deployment.
+The core live acceptance exercise passed against a Mac Mini T3Code environment: draft-PR delivery, same-session follow-up, restart recovery and cancellation with preserved edits. See [the acceptance record](docs/acceptance/nor-173.md) for evidence, tested configuration, an observed orphaned-child-process limitation during cancellation, and remaining live coverage limits. Verify your own deployment using the checklist below.
 
 ## Setup
 
@@ -139,7 +139,7 @@ The health and smoke checks do not start a coding task or establish end-to-end r
 
 ### 5. Verify a disposable delegation
 
-Create a disposable repository and an issue in a mapped Linear project. Delegate that issue to your installed app, then verify its T3Code thread, isolated worktree, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md).
+Create a disposable repository and an issue in a mapped Linear project. Delegate that issue to your installed app, then verify its T3Code thread, isolated worktree, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md). To test Linear's native stop signal, open the active agent session's menu and select **Send stop request** (see [Linear's signal documentation](https://linear.app/developers/agent-signals)). Allow enough time to find the control before the test turn finishes.
 
 Use your own process supervisor for ongoing operation. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
 
