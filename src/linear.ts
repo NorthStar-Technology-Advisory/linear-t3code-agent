@@ -1,3 +1,4 @@
+import { registerSecrets } from "./secrets.js";
 import { config } from "./config.js";
 import { readJsonFile, writePrivateJsonFile, type TokenRecord } from "./storage.js";
 
@@ -43,16 +44,12 @@ function tokenStoreFallback(): TokenStore {
   return { installations: {} };
 }
 
-async function readTokenStore(): Promise<TokenStore> {
-  return readJsonFile<TokenStore>(config.TOKEN_STORE_PATH, tokenStoreFallback());
+async function readTokenStore(tokenPath = config.TOKEN_STORE_PATH): Promise<TokenStore> {
+  return readJsonFile<TokenStore>(tokenPath, tokenStoreFallback());
 }
 
-async function writeTokenStore(store: TokenStore): Promise<void> {
-  await writePrivateJsonFile(config.TOKEN_STORE_PATH, store);
-}
-
-async function selectInstallation(): Promise<{ store: TokenStore; appUserId: string; installation: StoredInstallation }> {
-  const store = await readTokenStore();
+async function selectInstallation(tokenPath?: string): Promise<{ store: TokenStore; appUserId: string; installation: StoredInstallation }> {
+  const store = await readTokenStore(tokenPath);
   const appUserId = store.default_app_user_id ?? Object.keys(store.installations)[0];
 
   if (!appUserId) {
@@ -71,6 +68,7 @@ async function refreshInstallation(
   store: TokenStore,
   appUserId: string,
   installation: StoredInstallation,
+  tokenPath = config.TOKEN_STORE_PATH,
 ): Promise<StoredInstallation> {
   if (!installation.refresh_token) {
     throw new Error("Linear access token expired and no refresh token is stored.");
@@ -85,6 +83,8 @@ async function refreshInstallation(
 
   const response = await fetch(LINEAR_TOKEN_URL, {
     method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(30_000),
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
@@ -92,7 +92,7 @@ async function refreshInstallation(
   const json = (await response.json()) as Partial<LinearTokenResponse> & { error_description?: string };
 
   if (!response.ok || !json.access_token || !json.expires_in) {
-    throw new Error(`Linear token refresh failed: ${json.error_description ?? `HTTP ${response.status}`}`);
+    throw new Error(`Linear token refresh failed (HTTP ${response.status}); reinstall or repair the stored credentials.`);
   }
 
   const refreshed: StoredInstallation = {
@@ -107,26 +107,39 @@ async function refreshInstallation(
 
   store.installations[appUserId] = refreshed;
   store.default_app_user_id = appUserId;
-  await writeTokenStore(store);
+  await writePrivateJsonFile(tokenPath, store);
   return refreshed;
 }
 
-async function getAccessToken(): Promise<string> {
-  const { store, appUserId, installation } = await selectInstallation();
+async function loadAccessToken(tokenPath: string): Promise<string> {
+  const { store, appUserId, installation } = await selectInstallation(tokenPath);
 
+  registerSecrets(installation.access_token, installation.refresh_token);
   if (installation.expires_at - REFRESH_SKEW_MS > now()) {
     return installation.access_token;
   }
 
-  const refreshed = await refreshInstallation(store, appUserId, installation);
+  const refreshed = await refreshInstallation(store, appUserId, installation, tokenPath);
+  registerSecrets(refreshed.access_token, refreshed.refresh_token);
   return refreshed.access_token;
 }
 
-export async function linearGraphql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-  const accessToken = await getAccessToken();
+const tokenRequests = new Map<string, Promise<string>>();
+export function getAccessToken(tokenPath = config.TOKEN_STORE_PATH): Promise<string> {
+  const existing = tokenRequests.get(tokenPath);
+  if (existing) return existing;
+  const pending = loadAccessToken(tokenPath).finally(() => { tokenRequests.delete(tokenPath); });
+  tokenRequests.set(tokenPath, pending);
+  return pending;
+}
 
-  const response = await fetch(LINEAR_GRAPHQL_URL, {
+export async function linearGraphql<T>(query: string, variables?: Record<string, unknown>, options?: { endpoint?: string; tokenPath?: string }): Promise<T> {
+  const accessToken = await getAccessToken(options?.tokenPath);
+
+  const response = await fetch(options?.endpoint ?? LINEAR_GRAPHQL_URL, {
     method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(30_000),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
@@ -137,7 +150,7 @@ export async function linearGraphql<T>(query: string, variables?: Record<string,
   const json = (await response.json()) as GraphqlResponse<T>;
 
   if (!response.ok || json.errors?.length) {
-    throw new Error(`Linear GraphQL failed: ${json.errors?.[0]?.message ?? `HTTP ${response.status}`}`);
+    throw new Error(`Linear GraphQL failed (HTTP ${response.status}); check credentials, scopes, access and the current schema.`);
   }
 
   if (!json.data) {
@@ -157,7 +170,7 @@ export async function getLinearViewer(): Promise<{ id: string; name?: string }> 
 export async function createAgentActivity(
   agentSessionId: string,
   content: AgentActivityContent,
-  options?: { ephemeral?: boolean },
+  options?: { ephemeral?: boolean; id?: string; endpoint?: string; tokenPath?: string },
 ): Promise<{ id: string }> {
   const data = await linearGraphql<{ agentActivityCreate: { success: boolean; agentActivity: { id: string } } }>(
     `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
@@ -168,11 +181,13 @@ export async function createAgentActivity(
     }`,
     {
       input: {
+        id: options?.id,
         agentSessionId,
         content,
         ephemeral: options?.ephemeral,
       },
     },
+    options,
   );
 
   if (!data.agentActivityCreate.success) {

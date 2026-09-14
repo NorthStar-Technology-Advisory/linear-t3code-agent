@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### NOR-173: Linear ↔ T3Code bridge
+
+- Replace the Pi runtime with authenticated T3Code orchestration and explicit project routing.
+- Add isolated worktrees, durable webhook intake and queues, command/outbox reconciliation, event replay, correlated questions and approvals, and cancellation without discarding work.
+- Refresh complete Linear context and delegate external retrieval to T3Code; report source availability and preserve oversized input in private files.
+- Verify draft-PR delivery and validation reports, enforce closed-PR lifecycle rules, and clean only verified clean/pushed worktrees.
+- Adapt configuration, installation and service assets; require Node.js 22.13 or newer. Live acceptance remains outstanding in `docs/acceptance/nor-173.md`.
+
+### Earlier upstream Pi changes
+
 Changes since `v0.1.0`.
 
 ### Added
