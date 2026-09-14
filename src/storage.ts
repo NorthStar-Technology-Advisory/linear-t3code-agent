@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -32,8 +33,12 @@ export async function readJsonFile<T>(filePath: string, fallback: T): Promise<T>
 
 export async function writePrivateJsonFile(filePath: string, value: unknown): Promise<void> {
   await ensureParent(filePath);
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
-  await fs.writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const tmpPath = `${filePath}.${randomUUID()}.tmp`;
+  const file = await fs.open(tmpPath, "wx", 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await file.sync();
+  } finally { await file.close(); }
   await fs.rename(tmpPath, filePath);
   await fs.chmod(filePath, 0o600);
 }

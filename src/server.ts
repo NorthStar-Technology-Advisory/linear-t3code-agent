@@ -1,8 +1,12 @@
 import crypto from "node:crypto";
 import express, { type Request, type Response } from "express";
-import { config, publicConfig } from "./config.js";
+import { config, publicConfig, projectRoutes } from "./config.js";
 import { completeOAuthInstall, consumeOAuthState, createInstallUrl } from "./oauth.js";
-import { handleAgentSessionWebhook } from "./session-runner.js";
+import { Bridge } from "./bridge.js";
+import { LinearClient } from "./linear-context.js";
+import { T3CodeRunner } from "./t3code-runner.js";
+import { GitHubPullRequests } from "./pull-requests.js";
+import { redact } from "./progress.js";
 import { isFreshWebhookTimestamp, verifyLinearSignature } from "./signature.js";
 
 type LinearWebhookPayload = {
@@ -28,24 +32,6 @@ function parseJsonBody(body: Buffer): unknown {
   return JSON.parse(body.toString("utf8"));
 }
 
-function logWebhook(payload: LinearWebhookPayload) {
-  const agentActivity = (payload as { agentActivity?: { content?: { type?: string; body?: string } } }).agentActivity;
-  console.log("linear webhook received", {
-    type: payload.type,
-    action: payload.action,
-    agentSessionId: payload.agentSession?.id,
-    issue: payload.agentSession?.issue?.identifier,
-    activityType: agentActivity?.content?.type,
-    activityBody: agentActivity?.content?.body?.slice(0, 120),
-  });
-}
-
-function handleAgentSessionEvent(payload: LinearWebhookPayload) {
-  void handleAgentSessionWebhook(payload).catch((error: Error) => {
-    console.error("failed to handle agent session webhook", { message: error.message });
-  });
-}
-
 function installSecretFromRequest(req: Request): string | undefined {
   const header = req.get("authorization");
   if (header?.startsWith("Bearer ")) return header.slice("Bearer ".length);
@@ -62,13 +48,13 @@ function isInstallAuthorized(req: Request): boolean {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-export function createApp() {
+export function createApp(bridge?: Bridge) {
   const app = express();
 
   app.disable("x-powered-by");
 
   app.get("/healthz", (_req: Request, res: Response) => {
-    res.json({ ok: true, service: "linear-pi-agent" });
+    res.json({ ok: true, service: "linear-t3code-agent" });
   });
 
   app.get("/linear/install", async (req: Request, res: Response, next: express.NextFunction) => {
@@ -109,7 +95,7 @@ export function createApp() {
 
       return res.type("text/plain").send(
         [
-          "Pi is installed in Linear.",
+          "T3Code bridge is installed in Linear.",
           `App user ID: ${install.viewerAppUserId}`,
           "You can close this tab.",
           "",
@@ -137,13 +123,18 @@ export function createApp() {
         return res.status(400).json({ ok: false, error: "invalid_json" });
       }
 
-      if (!isFreshWebhookTimestamp(payload.webhookTimestamp)) {
+      if (!isFreshWebhookTimestamp(payload?.webhookTimestamp)) {
         return res.status(401).json({ ok: false, error: "stale_webhook" });
       }
 
-      logWebhook(payload);
+      if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "invalid_payload" });
       if (payload.type === "AgentSessionEvent") {
-        handleAgentSessionEvent(payload);
+        if (!bridge) return res.status(503).json({ ok: false, error: "bridge_unavailable" });
+        try { bridge.accept(payload); }
+        catch (error) {
+          if (error instanceof Error && (error.name === "ZodError" || /requires|match/.test(error.message))) return res.status(400).json({ ok: false, error: "invalid_payload" });
+          return res.status(503).json({ ok: false, error: "intake_failed" });
+        }
       }
 
       return res.status(200).json({ ok: true, accepted: payload.type === "AgentSessionEvent" });
@@ -155,7 +146,7 @@ export function createApp() {
   });
 
   app.use((error: Error, _req: Request, res: Response, _next: express.NextFunction) => {
-    console.error("request failed", { name: error.name, message: error.message });
+    console.error("request failed", { name: error.name, message: redact(error.message) });
     res.status(500).json({ ok: false, error: "internal_error" });
   });
 
@@ -163,8 +154,19 @@ export function createApp() {
 }
 
 if (process.env.NODE_ENV !== "test") {
-  const app = createApp();
-  app.listen(config.PORT, config.HOST, () => {
-    console.log("linear pi agent listening", publicConfig());
+  process.umask(0o077);
+  const bridge = new Bridge({
+    databasePath: config.BRIDGE_DB_PATH, worktreeRoot: config.WORKTREE_ROOT, routes: projectRoutes,
+    concurrency: config.MAX_CONCURRENT_SESSIONS, runner: new T3CodeRunner(config.T3CODE_URL, config.T3CODE_TOKEN),
+    linear: new LinearClient(), pullRequests: new GitHubPullRequests(), pollMs: config.POLL_INTERVAL_MS,
+    prPollMs: config.PR_POLL_INTERVAL_MS, heartbeatMs: config.PROGRESS_HEARTBEAT_MS, progressDebounceMs: config.PROGRESS_DEBOUNCE_MS,
   });
+  const app = createApp(bridge);
+  const server = app.listen(config.PORT, config.HOST, () => {
+    bridge.start();
+    console.log("linear t3code bridge listening", publicConfig());
+  });
+  const shutdown = () => { server.close(); void bridge.close().then(() => process.exit(0)); };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }

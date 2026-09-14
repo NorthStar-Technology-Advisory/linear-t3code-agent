@@ -1,5 +1,5 @@
 {
-  "name": "linear-pi-agent",
+  "name": "linear-t3code-agent",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,22 +7,25 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "node --import tsx --test test/**/*.test.ts",
     "smoke:linear": "tsx src/linear-smoke.ts",
     "smoke:webhook": "tsx src/webhook-smoke.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.3",
     "dotenv": "^16.4.7",
     "express": "^4.22.2",
-    "undici": "^8.7.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.5",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.23.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }
