@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { writeFile } from "node:fs/promises";
+import { writeFile, realpath } from "node:fs/promises";
 import { z } from "zod";
 import { BridgeStore } from "./bridge-store.js";
 import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient } from "./linear-context.js";
-import { prepareWorktree, verifyProjectRepository, type Route } from "./repository.js";
+import { prepareCheckout, git, type Route } from "./repository.js";
 import { deliveryInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
@@ -22,21 +22,21 @@ type QueuedTurn = { id: string; body: string };
 type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
 type Session = {
   id: string; workspaceId: string; issueId: string; teamId?: string;
-  threadId: string; branch: string; worktree: string; route?: Route;
+  threadId: string; branch: string; worktree: string | null; route?: Route;
   status: "queued" | "running" | "paused" | "cancelled" | "cancelling" | "idle" | "closed";
   queue: QueuedTurn[]; command?: RunnerCommand;
   pendingProgress?: string; lastProgress?: string;
   pr?: PullRequest; lastPrCheckAt?: number; cleanup?: string;
   requests: PendingRequest[]; responses: RunnerCommand[];
   generation: number; cancelHadActive?: boolean; cancelCommand?: RunnerCommand; interrupted?: boolean; stopSent?: boolean;
-  created: boolean; active?: { messageId: string; turnId?: string; previousTurnId?: string };
+  created: boolean; workspaceRequested?: boolean; bootstrapRecoveryPending?: boolean; active?: { messageId: string; turnId?: string; previousTurnId?: string };
   sequence: number; seenActivities: string[]; createdAt: string; updatedAt: string;
   lastReportAt: number; lastError?: string; contextFingerprint?: string;
 };
 type Outbound = { attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
 type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[] };
 export type BridgeOptions = {
-  databasePath: string; worktreeRoot: string; routes: Record<string, Route>;
+  databasePath: string; worktreeRoot: string;
   pullRequests: PullRequests; prPollMs: number;
   concurrency: number; runner: Runner; linear: LinearClient;
   pollMs: number; heartbeatMs: number; progressDebounceMs: number;
@@ -69,14 +69,14 @@ export class Bridge {
         const now = new Date().toISOString();
         session = state.sessions[id] = {
           id, workspaceId: payload.organizationId, issueId: payload.agentSession.issue.id,
-          threadId, branch: `linear/${threadId}`, worktree: path.resolve(this.options.worktreeRoot, threadId),
+          threadId, branch: `linear/${threadId}`, worktree: null,
           status: "queued", queue: [], created: false, generation: 0, requests: [], responses: [], sequence: 0, seenActivities: [],
           createdAt: now, updatedAt: now, lastReportAt: Date.now(),
         };
       }
       if (session.workspaceId !== payload.organizationId) throw new Error("Workspace does not match the existing session.");
       if (session.status === "closed") {
-        this.report(state, session, "error", "This session's PR is closed or merged. Start a new delegation for further implementation.");
+        this.report(state, session, "error", "This session has ended. Start a new delegation for further implementation; resume cannot reopen it.");
         return;
       }
       const body = payload.agentActivity?.content?.body?.trim().toLowerCase();
@@ -87,6 +87,10 @@ export class Bridge {
       }
       if (body === "resume" && session.status === "paused") {
         session.status = "queued";
+        if (session.bootstrapRecoveryPending) {
+          if (session.command) delete session.command.bootstrap;
+          delete session.bootstrapRecoveryPending;
+        }
         delete session.lastError;
         if (!session.queue.length && !session.active) session.queue.push({ id: randomUUID(), body: "Resume the previous task, inspect its failure and complete the remaining work." });
         this.report(state, session, "thought", "Resuming preserved work and queued prompts.");
@@ -187,6 +191,15 @@ export class Bridge {
     session.queue = []; session.requests = []; session.responses = [];
     delete session.cancelCommand; delete session.interrupted; delete session.stopSent;
   }
+  private async reconcileWorkspace(session: Session, thread: RunnerThread): Promise<Session> {
+    if (session.route?.workspaceMode !== "worktree" || session.worktree || !thread.worktreePath || !session.workspaceRequested) return session;
+    const workspace = await realpath(thread.worktreePath);
+    const entries = (await git(session.route.repository, "worktree", "list", "--porcelain")).split("\n\n");
+    const registered = entries.some(entry => entry.split("\n").includes(`worktree ${workspace}`) && entry.split("\n").includes(`branch refs/heads/${session.branch}`));
+    if (thread.projectId !== session.route.t3ProjectId || thread.branch !== session.branch || workspace === await realpath(session.route.repository) || !registered) throw new IntegrationError("T3Code bootstrap returned an unexpected workspace; inspect the thread before resuming.", false);
+    this.store.update(s => { if (s.sessions[session.id].generation === session.generation) s.sessions[session.id].worktree = thread.worktreePath; });
+    return this.session(session.id);
+  }
   private assertThreadIdentity(session: Session, thread: RunnerThread) {
     if (thread.projectId !== session.route!.t3ProjectId || thread.branch !== session.branch || thread.worktreePath !== session.worktree) {
       throw new IntegrationError("T3Code thread routing changed; reconcile its project, branch and worktree before resuming.", false);
@@ -204,7 +217,7 @@ export class Bridge {
       return true;
     }
     let cleanup: string;
-    try { cleanup = await cleanupWorktree(session.route, session.worktree); }
+    try { cleanup = session.route.workspaceMode === "local" ? "Current checkout files and branch preserved; reservation released." : session.worktree ? await cleanupWorktree(session.route, session.worktree) : "No verified worktree path; files preserved for manual inspection."; }
     catch { cleanup = "Worktree preserved: cleanup could not verify clean, fully pushed state. Check git access before manual cleanup."; }
     if (this.session(session.id).generation !== session.generation) return true;
     this.store.update(s => {
@@ -304,14 +317,25 @@ export class Bridge {
       });
       return;
     }
+    if (snapshot) {
+      const generation = session.generation;
+      try { session = await this.reconcileWorkspace(session, snapshot.thread); }
+      catch {
+        this.store.update(s => this.report(s, s.sessions[session.id], "error", "Provider stopped, but the worktree identity could not be verified. Files are preserved; inspect and restore the T3Code workspace before resuming."));
+      }
+      if (this.session(session.id).generation !== generation) return;
+    }
     this.store.update(s => {
       const current = s.sessions[session.id];
-      current.status = current.queue.length ? "queued" : "cancelled";
+      const ended = current.route?.workspaceMode === "local";
+      current.status = ended ? "closed" : current.queue.length ? "queued" : "cancelled";
+      if (ended) current.queue = [];
+      if (current.command?.bootstrap && current.worktree && !snapshot?.thread.messages.some(m => m.id === current.active?.messageId)) current.bootstrapRecoveryPending = true;
       current.created = Boolean(snapshot);
       delete current.active; delete current.command; delete current.cancelCommand; delete current.interrupted; delete current.stopSent;
       const outcome = current.cancelHadActive ? "T3Code provider stopped by user." : "No active coding turn remained; any T3Code provider session is stopped.";
       delete current.cancelHadActive;
-      this.report(s, current, "error", `${outcome} Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved. Descendant-process cleanup is delegated to T3Code.`);
+      this.report(s, current, "error", `${outcome}${ended ? " This current-checkout session has ended and its reservation is released. Start a new delegation for further work; resume cannot reopen it." : ""} Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved. Descendant-process cleanup is delegated to T3Code.`);
     });
   }
   private async step(id: string) {
@@ -327,25 +351,37 @@ export class Bridge {
     if (!session.route) {
       const issue = await this.options.linear.issue(session.issueId);
       if (!stillCurrent()) return;
-      const route = issue.project && Object.hasOwn(this.options.routes, issue.project.id) && this.options.routes[issue.project.id];
-      if (!route) {
-        this.store.update(s => { s.sessions[id].status = "paused"; this.report(s, s.sessions[id], "error", "This Linear project is unmapped. Add its project ID to PROJECT_ROUTES, then send resume."); });
-        return;
-      }
-      const project = (await this.options.runner.projects()).find(p => p.id === route.t3ProjectId);
-      if (!project) throw new Error("Mapped T3Code project does not exist. Fix PROJECT_ROUTES and resume.");
-      await verifyProjectRepository(route.repository, project.workspaceRoot);
+      let route: Route;
+      try {
+        const title = await this.options.linear.projectTitle(issue.project?.id);
+        const matches = (await this.options.runner.projects()).filter(p => p.deletedAt === null && p.title === title);
+        if (matches.length === 0) throw new Error(`No active T3Code project has the exact title "${title}". Correct the label or project title, then send resume.`);
+        if (matches.length > 1) throw new Error(`Multiple T3Code projects have title "${title}": ${matches.map(p => p.workspaceRoot).join(", ")}. Rename them to unique titles, correct the label, then send resume.`);
+        const project = matches[0]!;
+        const execution = await this.options.runner.execution(project);
+        route = { repository: execution.workspaceMode === "local" ? await realpath(project.workspaceRoot) : project.workspaceRoot, t3ProjectId: project.id, ...execution, baseBranch: "" };
+        if (route.workspaceMode === "worktree") route.baseBranch = await this.options.runner.baseBranch(route.repository);
+      } catch (error) { throw new IntegrationError(error instanceof Error ? error.message : "Project resolution failed; correct T3Code settings and send resume.", false); }
       if (!stillCurrent()) return;
-      this.store.update(s => { s.sessions[id].route = route; s.sessions[id].teamId = issue.team.id; });
+      this.store.update(s => {
+        if (route.workspaceMode === "local") {
+          const occupant = Object.values(s.sessions).find(other => other.id !== id && other.route?.workspaceMode === "local" && other.route.repository === route.repository && other.status !== "closed");
+          if (occupant) throw new IntegrationError(`Checkout ${route.repository} is reserved by Linear session ${occupant.id}. After that session ends through PR closure or cancel, send resume here.`, false);
+          s.sessions[id].worktree = null;
+        }
+        s.sessions[id].route = route; s.sessions[id].teamId = issue.team.id;
+      });
       session = this.session(id);
     }
     if (!session.created) {
-      await prepareWorktree(session.route!, session.worktree, session.branch);
+      try {
+        if (session.route!.workspaceMode === "local") await prepareCheckout(session.route!, session.branch);
+      } catch (error) { throw new IntegrationError(`${error instanceof Error ? error.message : "Workspace preparation failed."} Files preserved; correct Git state and send resume.`, false); }
       if (!stillCurrent()) return;
       const command: RunnerCommand = session.command ?? {
         type: "thread.create", commandId: randomUUID(), threadId: session.threadId,
         projectId: session.route!.t3ProjectId, title: `Linear ${session.issueId}`,
-        modelSelection: { instanceId: session.route!.provider, model: session.route!.model },
+        modelSelection: session.route!.modelSelection,
         runtimeMode: "full-access", interactionMode: "default", branch: session.branch,
         worktreePath: session.worktree, createdAt: session.createdAt,
       };
@@ -358,9 +394,14 @@ export class Bridge {
       this.store.update(s => { s.sessions[id].created = true; delete s.sessions[id].command; });
       return;
     }
+    if (session.route!.workspaceMode === "local" && await git(session.route!.repository, "branch", "--show-current") !== session.branch) {
+      throw new IntegrationError("Current checkout is no longer on the session branch. Restore its branch in Git and send resume; files are preserved.", false);
+    }
     let snapshot = await this.options.runner.snapshot(session.threadId);
     if (!stillCurrent()) return;
     if (!snapshot) throw new Error("T3Code thread is missing; restore it before resuming this session.");
+    session = await this.reconcileWorkspace(session, snapshot.thread);
+    if (!stillCurrent()) return;
     this.assertThreadIdentity(session, snapshot.thread);
     const replayed = await this.options.runner.replay(session.threadId, session.sequence);
     if (!stillCurrent()) return;
@@ -400,7 +441,16 @@ export class Bridge {
     if (!paused && session.command) {
       // A lost acknowledgement is reconciled against the user message first. If absent,
       // T3Code's durable command receipts make replay of the SAME command id safe.
-      if (!snapshot.thread.messages.some(m => m.id === session.active?.messageId)) await this.options.runner.dispatch(session.command);
+      if (!snapshot.thread.messages.some(m => m.id === session.active?.messageId)) {
+        if (session.worktree && session.command.bootstrap) {
+          this.store.update(s => {
+            const current = s.sessions[id]; current.bootstrapRecoveryPending = true; current.status = "paused";
+            this.report(s, current, "error", "T3Code prepared the worktree, but setup and the first turn are unconfirmed. Inspect the setup in T3Code and complete or repair it, then send resume. The prepared workspace is preserved; neither setup nor coding will be retried automatically.");
+          });
+          return;
+        }
+        await this.options.runner.dispatch(session.command);
+      }
       if (!stillCurrent()) return;
       this.store.update(s => { delete s.sessions[id].command; });
       return;
@@ -432,6 +482,10 @@ export class Bridge {
       return;
     }
     if (!paused && session.queue.length) {
+      if (session.bootstrapRecoveryPending) {
+        this.store.update(s => { s.sessions[id].status = "paused"; this.report(s, s.sessions[id], "error", "Worktree setup remains unconfirmed. Inspect and complete or repair setup in T3Code, then send resume."); });
+        return;
+      }
       if (await this.checkPr(session)) return;
       if (!stillCurrent()) return;
       const issue = await this.options.linear.issue(session.issueId);
@@ -453,14 +507,18 @@ export class Bridge {
       const command: RunnerCommand = {
         type: "thread.turn.start", commandId: randomUUID(), threadId: session.threadId,
         message: { messageId: turn.id, role: "user", text, attachments: [] },
-        modelSelection: { instanceId: session.route!.provider, model: session.route!.model },
+        modelSelection: session.route!.modelSelection,
         runtimeMode: "full-access", interactionMode: "default", createdAt: new Date().toISOString(),
+        ...(session.route!.workspaceMode === "worktree" && !session.worktree ? { bootstrap: {
+          prepareWorktree: { projectCwd: session.route!.repository, baseBranch: session.route!.baseBranch, branch: session.branch, startFromOrigin: session.route!.startFromOrigin }, runSetupScript: true,
+        } } : {}),
       };
       this.store.update(s => {
         const current = s.sessions[id];
         this.report(s, current, "thought", `${contextChange} Context inventory: ${context.inventory.filter(i => i.status === "supplied").length} supplied, ${context.inventory.filter(i => i.status === "externally delegated").length} externally delegated (not yet read), ${context.unavailable.length} unavailable.${context.unavailable.length ? ` Unavailable: ${context.unavailable.join(", ")}` : ""}`);
         current.contextFingerprint = context.fingerprint;
         current.command = command;
+        if (command.bootstrap) current.workspaceRequested = true;
         current.active = { messageId: turn.id, previousTurnId: snapshot.thread.latestTurn?.turnId };
         current.queue.shift();
       });
