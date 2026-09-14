@@ -15,7 +15,7 @@ const WebhookSchema = z.object({
   action: z.enum(["created", "prompted"]), organizationId: z.string().min(1),
   agentSession: z.object({ id: z.string().min(1), issue: z.object({ id: z.string().min(1) }).nullish() }),
   agentActivity: z.object({ id: z.string().optional(), signal: z.string().nullish(), content: z.object({ type: z.string().optional(), body: z.string().optional() }).optional() }).optional(),
-  promptContext: z.string().optional(), guidance: z.array(z.object({ body: z.string().optional() }).passthrough()).optional(),
+  promptContext: z.string().optional(), guidance: z.array(z.object({ body: z.string().optional() }).passthrough()).nullish(),
 });
 type Webhook = z.infer<typeof WebhookSchema>;
 type QueuedTurn = { id: string; body: string };

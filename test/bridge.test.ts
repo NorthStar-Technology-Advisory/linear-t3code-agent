@@ -171,6 +171,19 @@ test("signed delegation creates one isolated configured T3Code turn and reports 
   assert.ok(f.activities.some(a => a.content.type === "thought"));
 });
 
+test("Linear created webhook with null guidance starts one durable turn", async t => {
+  const f = await fixture(t);
+  const payload = { ...delegation(), guidance: null, promptContext: "Implement the delegated issue." };
+  assert.equal((await f.send(payload)).status, 200);
+  await f.restart();
+  assert.equal((await f.send(payload)).status, 200);
+  await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
+  const turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 1);
+  assert.match(turns[0].message.text, /Implement the delegated issue/);
+});
+
 const followup = (id: string, body: string, session = "session-1", signal?: string) => ({ ...delegation(session), action: "prompted", agentActivity: { id, signal, content: { type: "prompt", body } } });
 function finish(f: Awaited<ReturnType<typeof fixture>>, state = "completed") {
   const thread = [...f.threads.values()][0];
