@@ -1,29 +1,147 @@
-# Linear ↔ T3Code agent bridge
+# Linear T3Code Agent
 
-Delegate a Linear issue to an existing T3Code environment. Each Linear Agent Session gets its own T3Code thread, git worktree and branch. The coding agent implements and tests the task, pushes the branch, and opens a draft PR for human review. Follow-ups reuse that session; the bridge never merges PRs.
+A fork of [hiasinho/linear-pi-agent](https://github.com/hiasinho/linear-pi-agent), adapted to connect Linear Agent Sessions to an existing [T3Code](https://github.com/pingdotgg/t3code) environment.
 
-Forked from [linear-pi-agent](https://github.com/hiasinho/linear-pi-agent). The Linear OAuth, signed webhook and progress-formatting foundations remain; Pi is no longer a runtime dependency.
+Delegate a Linear issue to the app and follow its progress in Linear. The coding agent implements and tests the task, pushes a branch, and opens a draft GitHub PR for human review. Each Linear Agent Session gets its own T3Code thread, git worktree and branch. Follow-ups continue in that session and update its open PR. The bridge never merges PRs.
+
+## What changed from linear-pi-agent
+
+The original project connects Linear to the Pi coding agent. This fork retains its Linear OAuth installation, signed webhook intake and progress-formatting foundations, and replaces Pi execution with T3Code's authenticated orchestration API. Credit for the original integration goes to the [upstream project](https://github.com/hiasinho/linear-pi-agent).
+
+| Area | This fork |
+| --- | --- |
+| Coding runtime | Your running T3Code environment and its configured providers/models |
+| Repository selection | Explicit mapping from Linear project UUIDs to repositories and T3Code projects |
+| Session isolation | One T3Code thread, worktree and branch per Linear Agent Session |
+| Recovery | SQLite-backed queues, command identities, pending requests and event replay positions |
+| Delivery | Draft GitHub PRs, validation reports and follow-ups on the same PR |
+| Pi configuration | No Pi executable or SDK required; `PI_*` settings are not used |
+
+The bridge runs as a separate service and checkout from the application repositories it modifies. T3Code owns the coding execution; the bridge handles Linear communication, routing and delivery tracking.
+
+```text
+Linear issue / Agent Session
+  → signed webhook → bridge and durable SQLite state
+  → T3Code thread → isolated worktree and branch → draft GitHub PR
+  → progress, questions and results back to Linear
+```
+
+When moving from linear-pi-agent, configure the T3Code connection and project routes below. Existing Pi sessions are not migrated to T3Code; start new delegations after setup.
+
+## Requirements
+
+- Node.js **22.13 or newer**, npm, git and authenticated GitHub CLI (`gh`).
+- A running T3Code environment with a working coding provider and model.
+- Repository clones with a configured git identity and credentials that can push branches and create PRs.
+- A Linear workspace admin to create and install the OAuth app.
+- A public HTTPS address, through a reverse proxy or tunnel, forwarding to the bridge's localhost listener.
+- The bridge and T3Code must see the same repository, worktree and context files at the same absolute paths. Running them on the same host is the simplest arrangement. A remote T3Code host needs shared files at identical paths; the bridge does not transfer checkouts.
+
+Live end-to-end acceptance is still in progress. See [the acceptance record](docs/acceptance/nor-173.md) for completed checks and outstanding validation before relying on this deployment.
 
 ## Setup
 
-See [INSTALL.md](INSTALL.md). Requirements:
+The steps below cover a fresh installation. [INSTALL.md](INSTALL.md) also provides a compact deployment checklist suitable for a coding agent.
 
-- Node.js **22.13 or newer**, npm, git and authenticated `gh`.
-- One Linear OAuth installation and one authenticated T3Code environment.
-- The bridge and T3Code run under the same dedicated account, with the same repository, worktree and context paths available. A private remote environment needs identical shared paths; the bridge does not transfer git checkouts to another host.
-- Existing T3Code projects mapped explicitly to repositories and Linear project UUIDs.
-- A public HTTPS endpoint for Linear, forwarded to the bridge's localhost listener.
+### 1. Prepare the bridge and T3Code
+
+Clone this fork separately from your target repositories, then run:
 
 ```sh
+git clone https://github.com/NorthStar-Technology-Advisory/linear-t3code-agent.git
+cd linear-t3code-agent
 npm ci
 cp .env.example .env
-# Fill in credentials, URLs and PROJECT_ROUTES.
+chmod 600 .env
+```
+
+In T3Code, register each target repository as a project. Record its project ID, workspace root, provider instance ID and model ID. Obtain a bearer credential with `orchestration:read` and `orchestration:operate` using T3Code's current [environment authentication flow](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md).
+
+Set these values in `.env`:
+
+```dotenv
+T3CODE_URL=http://127.0.0.1:3773
+T3CODE_TOKEN=your-private-t3code-bearer-token
+T3CODE_PROVIDER=codex
+T3CODE_MODEL=your-configured-model-id
+PROJECT_ROUTES='{"linear-project-uuid":{"repository":"/absolute/path/to/repository","t3ProjectId":"existing-t3-project-id","baseBranch":"main"}}'
+```
+
+Replace every placeholder. `codex` is an example provider instance ID; use the instance configured in your T3Code environment. See [routing and permissions](#routing-and-permissions) for additional route settings. You need the Linear project's UUID, not its display name or issue identifier; retrieve it through Linear's API or your Linear integration tooling.
+
+### 2. Choose the public bridge address
+
+Configure your HTTPS proxy or tunnel to forward to `http://127.0.0.1:8787`. Use your own address wherever `https://your-domain.example` appears below:
+
+```dotenv
+BASE_URL=https://your-domain.example
+LINEAR_REDIRECT_URI=https://your-domain.example/linear/oauth/callback
+```
+
+Expose `/linear/webhook`, `/linear/oauth/callback` and the protected `/linear/install` route. `/healthz` is optional. Keep the T3Code endpoint private. If your tunnel address changes, update `.env` and the Linear app's redirect and webhook URLs together, then restart the bridge.
+
+### 3. Create the Linear OAuth app
+
+Sign in as a workspace admin and open [Linear's new application form](https://linear.app/settings/api/applications/new), also available through **Settings → API**. Follow Linear's [agent setup documentation](https://linear.app/developers/agents) if the settings labels change.
+
+1. Select the intended workspace and create an OAuth application. Choose a recognizable name, such as **T3Code Agent**; this is how users will identify it in Linear. For an internal deployment, keep its distribution private if offered.
+2. Fill in the application's description and developer details. Use your own application or repository URL for any required website field.
+3. Set the redirect URI to `https://your-domain.example/linear/oauth/callback`. It must exactly match `LINEAR_REDIRECT_URI`.
+4. Save the app. Copy its **Client ID** and **Client secret** into `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` in your private `.env` file.
+5. In the app's webhook settings, enable webhooks and set the URL to `https://your-domain.example/linear/webhook`.
+6. Select **Agent session events** in the webhook resource list and save. Copy the **webhook signing secret** into `LINEAR_WEBHOOK_SECRET`.
+
+Use the normal authorization-code OAuth flow. The bridge's installation URL requests `read`, `write`, `app:assignable` and `app:mentionable` with `actor=app`, so the installation acts as the agent. You do not need to create or manually paste an installed access token. A personal Linear API key is not a substitute for this app installation.
+
+Your Linear configuration should now contain:
+
+```dotenv
+LINEAR_CLIENT_ID=your-app-client-id
+LINEAR_CLIENT_SECRET=your-app-client-secret
+LINEAR_WEBHOOK_SECRET=your-app-webhook-signing-secret
+INSTALL_SECRET=your-own-random-secret-at-least-16-characters
+```
+
+Generate `INSTALL_SECRET` locally, for example with `openssl rand -hex 32`, and save the result in `.env`. This is a separate secret protecting the bridge's installation endpoint. Store credentials in the service environment or private configuration file, never in issues, commits or chat. A webhook endpoint test will only succeed after the bridge starts in the next step.
+
+### 4. Start and install the app
+
+From the bridge checkout:
+
+```sh
 npm run typecheck
 npm run build
 npm start
 ```
 
-Use your own process supervisor. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
+In another terminal, check the listener and signed webhook intake:
+
+```sh
+curl http://127.0.0.1:8787/healthz
+npm run smoke:webhook
+```
+
+Then privately open this URL in your browser, substituting your domain and install secret:
+
+```text
+https://your-domain.example/linear/install?install_secret=YOUR_INSTALL_SECRET
+```
+
+Choose the intended Linear workspace and authorize the app. The callback displays **T3Code bridge is installed in Linear** when installation succeeds. The bridge stores the access and refresh tokens privately at `TOKEN_STORE_PATH` (default `./data/linear-tokens.json`). Keep the install URL out of shared messages and proxy logs; the endpoint also accepts the secret in an Authorization Bearer header.
+
+Verify the installed app identity:
+
+```sh
+npm run smoke:linear
+```
+
+The health and smoke checks do not start a coding task or establish end-to-end readiness.
+
+### 5. Verify a disposable delegation
+
+Create a disposable repository and an issue in a mapped Linear project. Delegate that issue to your installed app, then verify its T3Code thread, isolated worktree, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md).
+
+Use your own process supervisor for ongoing operation. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
 
 ## Routing and permissions
 
