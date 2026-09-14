@@ -29,6 +29,7 @@ export async function cleanupWorktree(route: Route, worktree: string): Promise<s
   const list = await git(route.repository, "worktree", "list", "--porcelain");
   if (!list.split("\n").includes(`worktree ${canonicalWorktree}`)) return "Worktree already removed; session mapping retained.";
   if (await git(worktree, "status", "--porcelain", "--untracked-files=all")) return "Worktree preserved: uncommitted or untracked changes remain.";
+  if (await git(worktree, "ls-files", "--others", "--ignored", "--exclude-standard")) return "Worktree preserved: ignored local files remain.";
   await git(route.repository, "fetch", "--prune", "origin");
   if (await git(worktree, "rev-list", "HEAD", "--not", "--remotes=origin")) return "Worktree preserved: commits are not reachable from the current origin refs.";
   await git(route.repository, "worktree", "remove", worktree);

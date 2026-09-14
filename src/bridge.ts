@@ -19,7 +19,7 @@ const WebhookSchema = z.object({
 });
 type Webhook = z.infer<typeof WebhookSchema>;
 type QueuedTurn = { id: string; body: string };
-type PendingRequest = { id: string; kind: "approval" | "question"; description: string; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
+type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
 type Session = {
   id: string; workspaceId: string; issueId: string; teamId?: string;
   threadId: string; branch: string; worktree: string; route?: Route;
@@ -28,7 +28,7 @@ type Session = {
   pendingProgress?: string; lastProgress?: string;
   pr?: PullRequest; lastPrCheckAt?: number; cleanup?: string;
   requests: PendingRequest[]; responses: RunnerCommand[];
-  generation: number; cancelCommand?: RunnerCommand; interrupted?: boolean; stopSent?: boolean;
+  generation: number; cancelHadActive?: boolean; cancelCommand?: RunnerCommand; interrupted?: boolean; stopSent?: boolean;
   created: boolean; active?: { messageId: string; turnId?: string; previousTurnId?: string };
   sequence: number; seenActivities: string[]; createdAt: string; updatedAt: string;
   lastReportAt: number; lastError?: string; contextFingerprint?: string;
@@ -117,7 +117,10 @@ export class Bridge {
           this.report(state, session, "elicitation", `Use the explicit response format for request ${request.id}. No approval was granted.`);
           return;
         }
-        if (!session.responses.some(r => r.requestId === request.id)) session.responses.push(command);
+        if ((!request.response || request.responseUnconfirmed) && !session.responses.some(r => r.requestId === request.id)) {
+          request.responseUnconfirmed = false;
+          session.responses.push(command);
+        }
         return;
       }
       session.queue.push({ id: randomUUID(), body: this.prompt(payload) });
@@ -154,7 +157,7 @@ export class Bridge {
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];
     for (const session of Object.values(this.store.read().sessions)) {
-      if (session.status === "running" || session.status === "cancelling") eligible.push(session.id);
+      if (session.status === "running" || session.status === "cancelling" || (session.status === "paused" && session.active)) eligible.push(session.id);
       else if (session.status === "queued" && (session.active || running < this.options.concurrency)) {
         this.store.update(s => { s.sessions[session.id].status = "running"; });
         if (!session.active) running++; eligible.push(session.id);
@@ -166,11 +169,12 @@ export class Bridge {
         const message = redact(error instanceof Error ? error.message : "Bridge operation failed.");
         this.store.update(state => {
           const session = state.sessions[id];
-          if (session.lastError !== message) this.report(state, session, "error", message);
+          const changed = session.lastError !== message;
+          if (changed) this.report(state, session, "error", message);
           session.lastError = message;
           if (error instanceof IntegrationError && !error.retryable && session.status !== "cancelling") {
+            if (session.status !== "paused" || changed) this.report(state, session, "error", "Integration requires attention. Work is preserved and paused; repair the configuration or adapter, then send resume.");
             session.status = "paused";
-            this.report(state, session, "error", "Integration requires attention. Work is preserved and paused; repair the configuration or adapter, then send resume.");
           }
         });
       }
@@ -178,6 +182,7 @@ export class Bridge {
   }
   private requestCancellation(session: Session) {
     session.generation++;
+    session.cancelHadActive = Boolean(session.active);
     session.status = "cancelling";
     session.queue = []; session.requests = []; session.responses = [];
     delete session.cancelCommand; delete session.interrupted; delete session.stopSent;
@@ -211,7 +216,7 @@ export class Bridge {
   private observe(id: string, thread: RunnerThread, sequence: number, reconciled = false) {
     this.store.update(state => {
       const session = state.sessions[id];
-      const previousRequests = session.requests.map(r => r.id);
+      const previousRequests = new Map(session.requests.map(r => [r.id, r]));
       if (reconciled) session.requests = [];
       const newActivities = thread.activities.filter(a => !session.seenActivities.includes(a.id));
       for (const activity of reconciled ? thread.activities : newActivities) {
@@ -224,15 +229,30 @@ export class Bridge {
           const questions = z.array(z.object({ id: z.string(), question: z.string(), multiSelect: z.boolean().optional() })).safeParse(activity.payload?.questions);
           const request: PendingRequest = {
             id: requestId, kind: activity.kind === "approval.requested" ? "approval" : "question",
-            description: JSON.stringify(activity.payload, null, 2), responseMode: typeof activity.payload?.responseMode === "string" ? activity.payload.responseMode : undefined, questions: questions.success ? questions.data : undefined,
+            description: JSON.stringify(activity.payload, null, 2), response: previousRequests.get(requestId)?.response, responseUnconfirmed: previousRequests.get(requestId)?.responseUnconfirmed, responseMode: typeof activity.payload?.responseMode === "string" ? activity.payload.responseMode : undefined, questions: questions.success ? questions.data : undefined,
           };
           session.requests = session.requests.filter(r => r.id !== request.id);
           session.requests.push(request);
         }
       }
+      for (const activity of newActivities) {
+        if (!/^provider\.(approval|user-input)\.respond\.failed$/.test(activity.kind)) continue;
+        const request = session.requests.find(r => r.id === activity.payload?.requestId);
+        if (!request) continue;
+        delete request.response; delete request.responseUnconfirmed;
+        session.responses = session.responses.filter(r => r.requestId !== request.id);
+        this.report(state, session, "elicitation", `T3Code provider response failed for request ${request.id}. The request remains pending. Check T3Code, then send a corrected explicit answer or approval; unrelated prompts remain queued.`);
+      }
+      if (reconciled) {
+        for (const request of session.requests) {
+          if (!request.response || request.responseUnconfirmed || session.responses.some(r => r.requestId === request.id)) continue;
+          request.responseUnconfirmed = true;
+          this.report(state, session, "elicitation", `T3Code still lists request ${request.id} as pending after a gap in event history. The prior response outcome is unknown. No response was resent. Inspect the request, then send a new explicit answer or approval if it should be retried.`);
+        }
+      }
       // Only elicit requests still pending after replaying the whole snapshot.
       for (const request of session.requests) {
-        if (!(reconciled && !previousRequests.includes(request.id)) && !newActivities.some(a => a.payload?.requestId === request.id && a.kind.endsWith(".requested"))) continue;
+        if (!(reconciled && !previousRequests.has(request.id)) && !newActivities.some(a => a.payload?.requestId === request.id && a.kind.endsWith(".requested"))) continue;
         const instruction = request.kind === "approval"
           ? `Reply exactly: approve ${request.id} OR decline ${request.id}.`
           : `Reply: answer ${request.id} followed by a JSON object mapping each question ID to its answer.`;
@@ -269,13 +289,29 @@ export class Bridge {
       this.store.update(s => { s.sessions[session.id].stopSent = true; delete s.sessions[session.id].cancelCommand; });
       return;
     }
-    if (snapshot?.thread.session && snapshot.thread.session.status !== "stopped") return;
+    if (snapshot?.thread.session && snapshot.thread.session.status !== "stopped") {
+      const replay = await this.options.runner.replay(session.threadId, session.sequence);
+      if (this.session(session.id).generation !== session.generation) return;
+      const activities = [...snapshot.thread.activities, ...(replay.snapshot?.thread.activities ?? []), ...replay.events.map(event => event.activity)];
+      this.store.update(state => {
+        const current = state.sessions[session.id];
+        for (const activity of activities) {
+          if (activity.kind !== "provider.session.stop.failed" || current.seenActivities.includes(activity.id)) continue;
+          current.seenActivities.push(activity.id);
+          this.report(state, current, "error", "T3Code provider stop failed. Work is still treated as active and later prompts remain queued. Check T3Code, then send cancel to retry stopping; no replacement coding turn will start before provider stop is confirmed.");
+        }
+        current.sequence = Math.max(current.sequence, snapshot.sequence, replay.snapshot?.sequence ?? 0);
+      });
+      return;
+    }
     this.store.update(s => {
       const current = s.sessions[session.id];
       current.status = current.queue.length ? "queued" : "cancelled";
       current.created = Boolean(snapshot);
       delete current.active; delete current.command; delete current.cancelCommand; delete current.interrupted; delete current.stopSent;
-      this.report(s, current, "error", "Stopped by user. Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved.");
+      const outcome = current.cancelHadActive ? "T3Code provider stopped by user." : "No active coding turn remained; any T3Code provider session is stopped.";
+      delete current.cancelHadActive;
+      this.report(s, current, "error", `${outcome} Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved. Descendant-process cleanup is delegated to T3Code.`);
     });
   }
   private async step(id: string) {
@@ -284,7 +320,7 @@ export class Bridge {
     if (session.pr && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) {
       if (await this.checkPr(session)) return;
     }
-    if (session.status !== "running") return;
+    if (session.status !== "running" && !(session.status === "paused" && session.active)) return;
     const generation = session.generation;
     const stillCurrent = () => this.session(id).generation === generation;
 
@@ -337,7 +373,8 @@ export class Bridge {
     for (const event of replayed.events) if (event.sequence <= snapshot.sequence) activities.set(event.activity.id, { ...event.activity, sequence: event.sequence });
     this.observe(id, { ...snapshot.thread, activities: [...activities.values()].sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0)) }, snapshot.sequence, Boolean(replayed.snapshot));
     session = this.session(id);
-    if (session.responses.length) {
+    const paused = session.status === "paused";
+    if (!paused && session.responses.length) {
       const response = session.responses[0];
       try {
         if (session.requests.some(r => r.id === response.requestId)) await this.options.runner.dispatch(response);
@@ -346,15 +383,21 @@ export class Bridge {
         if (!(error instanceof IntegrationError) || error.retryable) throw error;
         this.store.update(s => {
           s.sessions[id].responses.shift();
+          const request = s.sessions[id].requests.find(r => r.id === response.requestId);
+          if (request?.response) request.responseUnconfirmed = true;
           this.report(s, s.sessions[id], "elicitation", `T3Code rejected the response for ${String(response.requestId)}. Check the request and credentials, then send a corrected explicit response. No replacement was submitted automatically.`);
         });
         return;
       }
       if (!stillCurrent()) return;
-      this.store.update(s => { const current = s.sessions[id]; current.responses.shift(); current.requests = current.requests.filter(r => r.id !== response.requestId); });
+      this.store.update(s => {
+        const current = s.sessions[id]; current.responses.shift();
+        const request = current.requests.find(r => r.id === response.requestId);
+        if (request) { request.response = response; request.responseUnconfirmed = false; }
+      });
       return;
     }
-    if (session.command) {
+    if (!paused && session.command) {
       // A lost acknowledgement is reconciled against the user message first. If absent,
       // T3Code's durable command receipts make replay of the SAME command id safe.
       if (!snapshot.thread.messages.some(m => m.id === session.active?.messageId)) await this.options.runner.dispatch(session.command);
@@ -377,9 +420,10 @@ export class Bridge {
             current.pr = pr ?? current.pr;
             delete current.active;
             const success = latest.state === "completed" && result.complete && pr?.state === "OPEN" && pr.isDraft;
-            current.status = success ? (current.queue.length ? "queued" : "idle") : "paused";
+            current.status = success && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
+            delete current.command;
             const prReport = pr ? `PR: ${pr.url} (${pr.state}, ${pr.isDraft ? "draft" : "not draft"})` : "No draft PR found; delivery is incomplete.";
-            this.report(s, current, success ? "response" : "error", `${prReport}\n\n${result.body}${success ? "" : `\n\nT3Code turn ${latest.state}. Queued prompts are preserved and paused; send resume or cancel.`}`);
+            this.report(s, current, success ? "response" : "error", `${prReport}\n\n${result.body}${success && paused ? "\n\nQueued prompts remain paused after an integration failure; send resume or cancel." : success ? "" : `\n\nT3Code turn ${latest.state}. Queued prompts are preserved and paused; send resume or cancel.`}`);
           });
         }
       } else if (snapshot.thread.session?.status === "error") {
@@ -387,7 +431,7 @@ export class Bridge {
       }
       return;
     }
-    if (session.queue.length) {
+    if (!paused && session.queue.length) {
       if (await this.checkPr(session)) return;
       if (!stillCurrent()) return;
       const issue = await this.options.linear.issue(session.issueId);
@@ -399,11 +443,6 @@ export class Bridge {
       const contextText = context.text.length < 80_000 ? context.text : `Complete context (${context.text.length} characters) is supplied in ${contextFile}. Read this file in full before acting; no content was truncated.`;
       if (!stillCurrent()) return;
       const turn = session.queue[0];
-      const requiredReading = /\b(?:must|required to)\s+(?:read|review|consult|access|fetch)|\brequired\s+(?:material|document|attachment|context|comments)/i.test(`${issue.description ?? ""}\n${turn.body}`);
-      if (context.unavailable.length && requiredReading) {
-        this.store.update(s => { const current = s.sessions[id]; current.status = "paused"; this.report(s, current, "elicitation", `Required source material is unavailable: ${context.unavailable.join(", ")}. Restore access or clarify the requirement, then send resume. No turn was submitted.`); });
-        return;
-      }
       let text = `${deliveryInstructions}\n\n${contextChange}\n${contextText}\n\n${turn.body}`;
       if (text.length > 100_000) {
         const turnFile = path.join(directory, `${turn.id}.txt`);

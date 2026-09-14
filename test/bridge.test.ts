@@ -43,7 +43,7 @@ async function fixture(t: TestContext) {
   let sequence = 0;
   const issueOverrides: Record<string, any> = {};
   const reads: any[] = [];
-  const faults = { dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, replayFallback: false, rejectAnswer: false };
+  const faults = { dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -73,7 +73,7 @@ async function fixture(t: TestContext) {
       if (req.url === "/api/auth/websocket-ticket") { res.end(JSON.stringify({ ticket: "test-ticket", expiresAt: new Date(Date.now() + 30000).toISOString() })); }
       else if (req.url === "/api/orchestration/dispatch") {
         const command = JSON.parse(raw);
-        if (faults.rejectAnswer && command.type === "thread.user-input.respond") { faults.rejectAnswer = false; res.statusCode = 400; res.end("{}"); return; }
+        if (faults.rejectAnswer && ["thread.user-input.respond", "thread.approval.respond"].includes(command.type)) { faults.rejectAnswer = false; res.statusCode = 400; res.end("{}"); return; }
         if (faults.rejectBeforeTurn && command.type === "thread.turn.start") { faults.rejectBeforeTurn = false; res.statusCode = 503; res.end('{}'); return; }
         if (!commands.some(c => c.commandId === command.commandId)) {
           commands.push(command);
@@ -85,6 +85,10 @@ async function fixture(t: TestContext) {
             thread.latestTurn = { turnId: command.message.messageId, state: "running" };
             thread.session = { status: "running", activeTurnId: command.message.messageId, lastError: null };
           }
+          if (["thread.approval.respond", "thread.user-input.respond"].includes(command.type) && !faults.deferResponses) {
+            const thread = threads.get(command.threadId);
+            thread.activities.push({ id: command.commandId + "-resolved", kind: command.type === "thread.approval.respond" ? "approval.resolved" : "user-input.resolved", tone: "info", summary: "Request resolved", turnId: thread.latestTurn?.turnId ?? null, payload: { requestId: command.requestId } });
+          }
           if (command.type === "thread.session.stop" && !faults.deferStop) {
             const thread = threads.get(command.threadId);
             thread.session = { status: "stopped", activeTurnId: null, lastError: null };
@@ -94,6 +98,7 @@ async function fixture(t: TestContext) {
         if (faults.dropAcceptedTurn && command.type === "thread.turn.start") { faults.dropAcceptedTurn = false; res.destroy(); return; }
         res.end(JSON.stringify({ sequence }));
       } else if (req.url?.startsWith("/api/orchestration/threads/")) {
+        if (faults.snapshotDenied) { res.statusCode = 403; res.end("{}"); return; }
         if (faults.snapshotDown) { res.statusCode = 503; res.end("{}"); return; }
         const thread = threads.get(decodeURIComponent(req.url.split("/").at(-1)!));
         if (!thread) { res.statusCode = 404; res.end('{}'); }
@@ -338,12 +343,35 @@ test("unmapped projects cannot start work and issue text cannot override routing
   assert.ok(f.activities.some(a => /unmapped/.test(a.content.body)));
 });
 
-test("explicitly required missing Linear material pauses before submitting a turn", async t => {
+test("required available context does not make unrelated missing material a prerequisite", async t => {
+  const f = await fixture(t);
+  f.issueOverrides["issue-1"] = { description: "You must read the issue description before implementing. Existing comments are optional.", comments: null };
+  await f.send(delegation()); await f.tick();
+  const start = f.commands.find(c => c.type === "thread.turn.start");
+  assert.ok(start);
+  assert.match(start.message.text, /comments are optional/);
+  assert.match(start.message.text, /#comments/);
+  assert.match(start.message.text, /unavailable/);
+});
+
+test("missing prerequisites reach T3Code for clarification and explicit answers preserve queued work", async t => {
   const f = await fixture(t);
   f.issueOverrides["issue-1"] = { description: "You must read the existing comments before implementing.", comments: null };
   await f.send(delegation()); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 0);
-  assert.ok(f.activities.some(a => /required.*unavailable|unavailable.*required/i.test(a.content.body)));
+  const start = f.commands.find(c => c.type === "thread.turn.start");
+  assert.ok(start);
+  assert.match(start.message.text, /required material is unavailable, pause.*before implementation/);
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "prerequisite", kind: "user-input.requested", tone: "info", summary: "Comments are unavailable; are they required?", turnId: thread.latestTurn.turnId, payload: { requestId: "missing-comments", questions: [{ id: "required", question: "Are comments required?" }] } });
+  await f.tick();
+  await f.send(followup("later-work", "Then update the README"));
+  await f.restart(); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  await f.send(followup("waiver", 'answer missing-comments {"required":"Comments are optional; continue with the available description."}'));
+  await f.tick();
+  assert.match(f.commands.find(c => c.type === "thread.user-input.respond").answers.required, /optional/);
+  finish(f); await f.tick();
+  assert.match(f.commands.filter(c => c.type === "thread.turn.start")[1].message.text, /Then update the README/);
 });
 
 test("temporary rejection before acceptance retries one command after reconciling the snapshot", async t => {
@@ -505,4 +533,112 @@ test("native multi-select questions preserve selected answers as arrays", async 
   await f.tick(); await f.restart();
   await f.send(followup("multi-answer", 'answer multi-1 {"checks":["lint","test"]}')); await f.tick();
   assert.deepEqual(f.commands.find(c => c.type === "thread.user-input.respond").answers, { checks: ["lint", "test"] });
+});
+
+test("closed PR cleanup preserves ignored files across restart", async t => {
+  const f = await fixture(t);
+  const origin = path.join(f.root, "origin.git");
+  execFileSync("git", ["init", "--bare", origin]);
+  execFileSync("git", ["-C", f.repo, "remote", "add", "origin", origin]);
+  await writeFile(path.join(f.repo, ".gitignore"), "private.env\n");
+  execFileSync("git", ["-C", f.repo, "add", ".gitignore"]);
+  execFileSync("git", ["-C", f.repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "Ignore local config"]);
+  execFileSync("git", ["-C", f.repo, "push", "origin", "main"]);
+  await f.send(delegation()); await f.tick(); finish(f); await f.tick();
+  const thread = [...f.threads.values()][0];
+  const file = path.join(thread.worktreePath, "private.env");
+  await writeFile(file, "local configuration");
+  f.pr.state = "CLOSED"; await f.tick(); await f.restart(); await f.tick();
+  assert.equal(await readFile(file, "utf8"), "local configuration");
+  assert.ok(f.activities.some(a => /preserved.*ignored/i.test(a.content.body)));
+});
+
+test("provider response failures retain correlation until resolution across restart", async t => {
+  const f = await fixture(t);
+  f.faults.deferResponses = true;
+  await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  for (const [kind, id, body, commandType] of [
+    ["user-input", "question", 'answer question {"choice":"staging"}', "thread.user-input.respond"],
+    ["approval", "approval", "approve approval", "thread.approval.respond"],
+  ]) {
+    thread.activities.push({ id: id + "-requested", kind: kind + ".requested", tone: "info", summary: "Decision needed", turnId: thread.latestTurn.turnId, payload: { requestId: id, questions: [{ id: "choice", question: "Which environment?" }] } });
+    await f.tick(); await f.send(followup(id + "-answer", body)); await f.tick();
+    await f.restart(); await f.send(followup(id + "-duplicate", body)); await f.tick();
+    assert.equal(f.commands.filter(c => c.type === commandType).length, 1);
+    thread.activities.push({ id: id + "-failed", kind: "provider." + kind + ".respond.failed", tone: "error", summary: "Provider response failed", turnId: null, payload: { requestId: id } });
+    await f.tick(); await f.restart();
+    assert.ok(f.activities.some(a => a.content.type === "elicitation" && /failed/i.test(a.content.body) && a.content.body.includes(id)));
+    await f.send(followup(id + "-retry", body)); await f.tick();
+    assert.equal(f.commands.filter(c => c.type === commandType).length, 2);
+    thread.activities.push({ id: id + "-resolved", kind: kind + ".resolved", tone: "info", summary: "Resolved", turnId: thread.latestTurn.turnId, payload: { requestId: id } });
+    await f.tick();
+  }
+  await f.send(followup("next", "Next task")); finish(f); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
+});
+
+test("provider stop failure is reported and explicitly retried without releasing queued work", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  f.faults.deferStop = true;
+  await f.send(followup("stop-attempt", "stop")); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "stop-failed", kind: "provider.session.stop.failed", tone: "error", summary: "Provider stop failed", turnId: null, payload: {} });
+  await f.send(followup("queued-after-stop", "Later task")); await f.restart(); await f.tick();
+  assert.ok(f.activities.some(a => a.content.type === "error" && /stop.*failed/i.test(a.content.body) && /cancel/i.test(a.content.body)));
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  f.faults.deferStop = false;
+  await f.send(followup("stop-retry", "cancel")); await f.tick();
+  assert.equal(thread.session.status, "stopped");
+  assert.equal(f.commands.filter(c => c.type === "thread.session.stop").length, 2);
+  assert.ok(f.activities.some(a => /Pending prompts cleared/.test(a.content.body)));
+});
+
+test("completed paused provider releases capacity without resuming its queue", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  await f.send(followup("preserved", "Keep this queued"));
+  f.faults.snapshotDenied = true; await f.tick();
+  await f.send(delegation("session-2"));
+  finish(f); f.faults.snapshotDenied = false;
+  await f.restart(); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.create").length, 2);
+  const firstId = f.commands.find(c => c.type === "thread.create").threadId;
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start" && c.threadId === firstId).length, 1);
+});
+
+test("large-gap unresolved accepted answers allow explicit recovery without automatic resubmission", async t => {
+  const f = await fixture(t); f.faults.deferResponses = true;
+  await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "pinned", kind: "approval.requested", tone: "info", summary: "Approve?", turnId: thread.latestTurn.turnId, payload: { requestId: "pinned-approval" } });
+  await f.tick(); await f.send(followup("first-answer", "approve pinned-approval")); await f.tick();
+  f.faults.replayFallback = true;
+  await f.restart(); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.approval.respond").length, 1);
+  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /outcome.*unknown/i.test(a.content.body)));
+  await f.send(followup("unrelated-answer", "yes")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.approval.respond").length, 1);
+  f.faults.rejectAnswer = true;
+  await f.send(followup("explicit-recovery", "approve pinned-approval")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.approval.respond").length, 1);
+  await f.restart();
+  await f.send(followup("corrected-recovery", "approve pinned-approval")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.approval.respond").length, 2);
+});
+
+test("persistent denied snapshots do not repeat pause notifications", async t => {
+  const f = await fixture(t); await f.send(delegation()); await f.tick();
+  f.faults.snapshotDenied = true; await f.tick();
+  const count = f.activities.filter(a => a.content.type === "error").length;
+  await f.restart(); await f.tick();
+  assert.equal(f.activities.filter(a => a.content.type === "error").length, count);
+});
+
+test("cancelling before execution reports that no active turn remained", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.send(followup("cancel-before-start", "cancel")); await f.tick();
+  assert.equal(f.commands.length, 0);
+  assert.ok(f.activities.some(a => /no active.*turn/i.test(a.content.body)));
 });
