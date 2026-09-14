@@ -43,7 +43,7 @@ Use your own process supervisor. An optional user-systemd template is included a
 
 Unknown projects are rejected. The bridge verifies the selected T3Code project's workspace root against the configured repository. Routing, provider and model are persisted when the session starts; changing configuration does not redirect existing sessions. Issue text cannot select an arbitrary checkout.
 
-Access to this agent in the configured Linear workspace authorizes coding and draft-PR work with **full execution permissions**. Run both services under a dedicated OS account containing only intended credentials and integrations. Worktrees isolate checkouts; routing and T3Code projects are **not filesystem sandboxes**. The operator provisions that account. Keep T3Code private and use a bearer credential with only `orchestration:read` and `orchestration:write` scopes.
+Access to this agent in the configured Linear workspace authorizes coding and draft-PR work with **full execution permissions**. Run both services under a dedicated OS account containing only intended credentials and integrations. Worktrees isolate checkouts; routing and T3Code projects are **not filesystem sandboxes**. The operator provisions that account. Keep T3Code private and use a bearer credential with only `orchestration:read` and `orchestration:operate` scopes.
 
 ## Conversations and recovery
 
