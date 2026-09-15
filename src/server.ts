@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import express, { type Request, type Response } from "express";
-import { config, publicConfig, projectRoutes } from "./config.js";
+import { config, publicConfig } from "./config.js";
 import { completeOAuthInstall, consumeOAuthState, createInstallUrl } from "./oauth.js";
 import { Bridge } from "./bridge.js";
 import { LinearClient } from "./linear-context.js";
@@ -156,7 +156,7 @@ export function createApp(bridge?: Bridge) {
 if (process.env.NODE_ENV !== "test") {
   process.umask(0o077);
   const bridge = new Bridge({
-    databasePath: config.BRIDGE_DB_PATH, worktreeRoot: config.WORKTREE_ROOT, routes: projectRoutes,
+    databasePath: config.BRIDGE_DB_PATH, worktreeRoot: config.WORKTREE_ROOT,
     concurrency: config.MAX_CONCURRENT_SESSIONS, runner: new T3CodeRunner(config.T3CODE_URL, config.T3CODE_TOKEN),
     linear: new LinearClient(), pullRequests: new GitHubPullRequests(), pollMs: config.POLL_INTERVAL_MS,
     prPollMs: config.PR_POLL_INTERVAL_MS, heartbeatMs: config.PROGRESS_HEARTBEAT_MS, progressDebounceMs: config.PROGRESS_DEBOUNCE_MS,

@@ -19,8 +19,13 @@ export type RunnerThread = {
   session: { status: string; lastError: string | null; activeTurnId: string | null } | null;
 };
 export type ReplayResult = { events: Array<{ sequence: number; activity: RunnerActivity }>; snapshot?: { sequence: number; thread: RunnerThread } };
+export type ModelSelection = { instanceId: string; model: string; [key: string]: unknown };
+export type RunnerProject = { id: string; title: string; workspaceRoot: string; deletedAt: string | null; defaultModelSelection: ModelSelection | null; defaultThreadEnvMode?: "local" | "worktree" | null };
+export type ProjectExecution = { modelSelection: ModelSelection; workspaceMode: "local" | "worktree"; startFromOrigin: boolean };
 export interface Runner {
-  projects(): Promise<Array<{ id: string; workspaceRoot: string }>>;
+  projects(): Promise<RunnerProject[]>;
+  baseBranch(repository: string): Promise<string>;
+  execution(project: RunnerProject): Promise<ProjectExecution>;
   snapshot(threadId: string): Promise<{ sequence: number; thread: RunnerThread } | null>;
   replay(threadId: string, afterSequence: number): Promise<ReplayResult>;
   dispatch(command: RunnerCommand): Promise<void>;

@@ -2,7 +2,7 @@
 
 A fork of [hiasinho/linear-pi-agent](https://github.com/hiasinho/linear-pi-agent), adapted to connect Linear Agent Sessions to an existing [T3Code](https://github.com/pingdotgg/t3code) environment.
 
-Delegate a Linear issue to the app and follow its progress in Linear. The coding agent implements and tests the task, pushes a branch, and opens a draft GitHub PR for human review. Each Linear Agent Session gets its own T3Code thread, git worktree and branch. Follow-ups continue in that session and update its open PR. The bridge never merges PRs.
+Delegate a Linear issue to the app and follow its progress in Linear. The coding agent implements and tests the task, pushes a branch, and opens a draft GitHub PR for human review. Each Linear Agent Session gets its own T3Code thread and task branch, using the workspace mode configured in T3Code. Follow-ups continue in that session and update its open PR. The bridge never merges PRs.
 
 ## What changed from linear-pi-agent
 
@@ -11,8 +11,8 @@ The original project connects Linear to the Pi coding agent. This fork retains i
 | Area | This fork |
 | --- | --- |
 | Coding runtime | Your running T3Code environment and its configured providers/models |
-| Repository selection | Explicit mapping from Linear project UUIDs to repositories and T3Code projects |
-| Session isolation | One T3Code thread, worktree and branch per Linear Agent Session |
+| Repository selection | A Linear project label matching an active T3Code project title |
+| Session isolation | One thread and branch per session; new worktree or reserved current checkout |
 | Recovery | SQLite-backed queues, command identities, pending requests and event replay positions |
 | Delivery | Draft GitHub PRs, validation reports and follow-ups on the same PR |
 | Pi configuration | No Pi executable or SDK required; `PI_*` settings are not used |
@@ -22,11 +22,11 @@ The bridge runs as a separate service and checkout from the application reposito
 ```text
 Linear issue / Agent Session
   → signed webhook → bridge and durable SQLite state
-  → T3Code thread → isolated worktree and branch → draft GitHub PR
+  → T3Code thread → selected workspace and task branch → draft GitHub PR
   → progress, questions and results back to Linear
 ```
 
-When moving from linear-pi-agent, configure the T3Code connection and project routes below. Existing Pi sessions are not migrated to T3Code; start new delegations after setup.
+When moving from linear-pi-agent, configure the T3Code connection and project labels below. Existing Pi sessions are not migrated to T3Code; start new delegations after setup.
 
 ## Requirements
 
@@ -55,19 +55,17 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-In T3Code, register each target repository as a project. Record its project ID, workspace root, provider instance ID and model ID. Obtain a bearer credential with `orchestration:read` and `orchestration:operate` using T3Code's current [environment authentication flow](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md).
+In T3Code, register each target repository as a project with a unique, recognizable title. Configure its model and workspace preferences there, or let them inherit environment defaults. Obtain a bearer credential permitting orchestration reads/commands, settings and provider reads, and VCS branch/status reads using T3Code's current [environment authentication flow](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md).
 
 Set these values in `.env`:
 
 ```dotenv
 T3CODE_URL=http://127.0.0.1:3773
 T3CODE_TOKEN=your-private-t3code-bearer-token
-T3CODE_PROVIDER=codex
-T3CODE_MODEL=your-configured-model-id
-PROJECT_ROUTES='{"linear-project-uuid":{"repository":"/absolute/path/to/repository","t3ProjectId":"existing-t3-project-id","baseBranch":"main"}}'
+
 ```
 
-Replace every placeholder. `codex` is an example provider instance ID; use the instance configured in your T3Code environment. See [routing and permissions](#routing-and-permissions) for additional route settings. You need the Linear project's UUID, not its display name or issue identifier; retrieve it through Linear's API or your Linear integration tooling.
+In Linear **Settings → Projects → Labels**, create exactly one project label group named **T3Code project**. Add a child label whose plain-text name exactly matches the T3Code project title, including case and spaces, and select it on the Linear project containing your issue. For example, T3Code project **Payments API** uses child label **Payments API**. Apply the label to the project, not the issue. New Linear projects need only this label; no UUID mapping is required. See [Linear project labels](https://linear.app/docs/project-labels) and [routing and permissions](#routing-and-permissions).
 
 ### 2. Choose the public bridge address
 
@@ -139,29 +137,24 @@ The health and smoke checks do not start a coding task or establish end-to-end r
 
 ### 5. Verify a disposable delegation
 
-Create a disposable repository and an issue in a mapped Linear project. Delegate that issue to your installed app, then verify its T3Code thread, isolated worktree, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md). To test Linear's native stop signal, open the active agent session's menu and select **Send stop request** (see [Linear's signal documentation](https://linear.app/developers/agent-signals)). Allow enough time to find the control before the test turn finishes.
+Create a disposable repository and an issue in a labelled Linear project. Delegate that issue to your installed app, then verify its T3Code thread, selected workspace, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md). To test Linear's native stop signal, open the active agent session's menu and select **Send stop request** (see [Linear's signal documentation](https://linear.app/developers/agent-signals)). Allow enough time to find the control before the test turn finishes.
 
 Use your own process supervisor for ongoing operation. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
 
 ## Routing and permissions
 
-`PROJECT_ROUTES` is JSON keyed by Linear project UUID. Each entry contains an absolute `repository`, existing `t3ProjectId`, optional `baseBranch` (default `main`), and optional `provider`/`model` overrides. Otherwise `T3CODE_PROVIDER` and `T3CODE_MODEL` apply. The provider value is T3Code's configured **provider instance ID**.
+The bridge reads the selected child of the **T3Code project** project label group and matches its name exactly, case-sensitively, against active T3Code project titles. Deleted projects are excluded. Missing projects/groups/selections, multiple groups or selections, unknown titles and duplicate matching titles pause the session before execution. Duplicate-title errors list the matching workspace paths. Correct the labels or T3Code configuration, then send `resume`. Duplicate webhook delivery and ordinary follow-ups do not retry failed initial resolution.
 
-```json
-{
-  "linear-project-uuid": {
-    "repository": "/srv/repos/example",
-    "t3ProjectId": "existing-t3-project-id",
-    "provider": "codex",
-    "model": "your-model-id",
-    "baseBranch": "main"
-  }
-}
-```
+Provider/model choices come from T3Code's project overrides and environment defaults, with provider availability checked before work starts. A null snapshot override inherits the environment; a cleared effective model pauses until configured. The bridge does not choose a fallback model. Workspace precedence is the T3Code project setting, then repository `t3.json`, then the environment default. JSONC comments and trailing commas in `t3.json` are supported.
 
-Unknown projects are rejected. The bridge verifies the selected T3Code project's workspace root against the configured repository. Routing, provider and model are persisted when the session starts; changing configuration does not redirect existing sessions. Issue text cannot select an arbitrary checkout.
+- **New worktree:** T3Code prepares the worktree using its supported turn bootstrap, locations, start-from-origin preference, and configured setup script. The repository default branch is selected, falling back to the checked-out branch when no default is known.
+- **Current checkout:** the bridge reserves the canonical checkout path, then creates a task branch from current HEAD in that checkout. Existing files are preserved. Git failures pause with correction instructions. The reservation survives completed turns, idle periods, PR feedback, pauses and restarts. It covers bridge sessions; manual editor and shell activity remains outside it. If you change the checked-out branch manually, restore the session branch before resuming.
 
-Access to this agent in the configured Linear workspace authorizes coding and draft-PR work with **full execution permissions**. Run both services under a dedicated OS account containing only intended credentials and integrations. Worktrees isolate checkouts; routing and T3Code projects are **not filesystem sandboxes**. The operator provisions that account. Keep T3Code private and use a bearer credential with only `orchestration:read` and `orchestration:operate` scopes.
+A competing current-checkout session pauses and identifies the occupying session. Once that session ends through PR closure/merge or confirmed cancellation, send `resume` to the waiting session. It never starts automatically when the checkout becomes free. Independent worktree sessions can run concurrently within `MAX_CONCURRENT_SESSIONS`.
+
+The resolved project, workspace, model selection, workspace mode and branch/worktree identity persist for the session. Later renames, label edits and settings changes apply to new sessions. Issue text cannot select an arbitrary checkout. `PROJECT_ROUTES`, `T3CODE_PROVIDER` and `T3CODE_MODEL` are no longer used; this change has no legacy routing fallback or old-session migration.
+
+Access to this agent in the configured Linear workspace authorizes coding and draft-PR work with **full execution permissions**. Run both services under a dedicated OS account containing only intended credentials and integrations. Worktrees isolate checkouts; routing and T3Code projects are **not filesystem sandboxes**. The operator provisions that account. Keep T3Code private and use a bearer credential permitting the required orchestration, settings/provider and VCS read operations. The installed T3Code version determines the exact scopes; settings RPC failures identify missing access.
 
 ## Conversations and recovery
 
@@ -169,9 +162,11 @@ Signed, fresh webhook intake is committed to SQLite before returning HTTP 200. I
 
 The bridge reconciles T3Code snapshots and authenticated event catch-up. It retains exact command IDs across uncertain acknowledgements, using T3Code's durable command receipts. It never invents a new command ID to retry uncertain work. Linear activities have stable UUIDs and are looked up before retrying uncertain delivery. For a large replay gap, the bridge reconciles a fresh snapshot, including T3Code’s pinned pending requests, and reports that intermediate progress details are unavailable. Preserve the database and context directory when restarting or upgrading; do not delete state to repair a connection failure.
 
+If a bootstrap connection fails after worktree preparation but before the first turn is confirmed, the bridge pauses without rerunning setup or starting coding. Inspect the setup in T3Code, complete or repair it, then send `resume`. The existing worktree and command identity are retained.
+
 Responses remain pending until T3Code reports resolution. A provider response failure permits a corrected explicit reply. If event history is incomplete and a request is still pending, the bridge reports the prior response outcome as unknown; only a new explicit answer or approval retries it.
 
-Ordinary follow-ups run in arrival order. A failed or incomplete turn pauses the queue; send `resume` to continue or `cancel` to clear it. Fix configuration/access first if that was the blocker. Paused active turns are still observed so completed remote work releases capacity, while their follow-up queue remains paused. A later prompt resumes a cancelled session while its PR remains open. `MAX_CONCURRENT_SESSIONS` limits active sessions, including sessions waiting for an answer or for cancellation to finish.
+Ordinary follow-ups run in arrival order. A failed or incomplete turn pauses the queue; send `resume` to continue or `cancel` to clear it. Fix configuration/access first if that was the blocker. Paused active turns are still observed so completed remote work releases capacity, while their follow-up queue remains paused. A later prompt can resume a cancelled **worktree** session while its PR remains open. In **current-checkout** mode, cancellation ends the session permanently after the provider stops, releases its reservation even when no PR exists, and preserves files, branch and any PR. Further work requires a new delegation; `resume` cannot reopen that ended session. `MAX_CONCURRENT_SESSIONS` limits active sessions, including sessions waiting for an answer or for cancellation to finish.
 
 Questions and approvals appear in Linear with request IDs:
 
@@ -191,14 +186,14 @@ External links are supplied to T3Code for retrieval through its authorized tools
 
 The agent returns a structured result with validation commands, outcomes, blockers and context access. The bridge checks for the session branch's draft PR through `gh`. Missing validation, failed/unavailable checks, blockers or a missing draft are reported as incomplete, with the PR link when available. Validation is identified as **reported by T3Code**. Same-session follow-ups update the existing PR. Once it closes or merges, further implementation requires a new delegation.
 
-On PR closure, the bridge removes the worktree only when it is clean and its commits are reachable from freshly fetched origin refs. Dirty, untracked, unpushed, unverifiable and squash-merge cases are preserved conservatively and reported. Branches and session mappings remain. Ignored local files are checked explicitly and also preserve the worktree; git can otherwise delete them even without force.
+On PR closure or merge, active execution is stopped first. Current-checkout sessions release their reservation and preserve all checkout files and the task branch; worktree-removal cleanup never targets the current checkout. For worktree sessions, the bridge removes the worktree only when it is clean and its commits are reachable from freshly fetched origin refs. Dirty, untracked, unpushed, unverifiable and squash-merge cases are preserved conservatively and reported. Branches and session mappings remain. Ignored local files are checked explicitly and also preserve the worktree; git can otherwise delete them even without force.
 
 ## Operations
 
 | Setting | Default |
 | --- | --- |
 | `BRIDGE_DB_PATH` | `./data/bridge.sqlite` |
-| `WORKTREE_ROOT` | `./data/worktrees` |
+| `WORKTREE_ROOT` (context/attachment storage; T3Code places worktrees) | `./data/worktrees` |
 | `MAX_CONCURRENT_SESSIONS` | `1` |
 | `POLL_INTERVAL_MS` | `1000` |
 | `PR_POLL_INTERVAL_MS` | `60000` |
@@ -210,4 +205,4 @@ Expose `/linear/webhook`, `/linear/oauth/callback`, and the protected `/linear/i
 
 Run `npm test` for the integrated controlled-service suite, `npm run typecheck`, and `npm run build`. `npm run smoke:webhook` checks signed intake without creating a session; `npm run smoke:linear` checks the installed Linear identity without posting activities.
 
-T3Code is not version-pinned. The adapter follows its authenticated [HTTP contract](https://github.com/pingdotgg/t3code/blob/main/packages/contracts/src/environmentHttp.ts), [orchestration contract](https://github.com/pingdotgg/t3code/blob/main/packages/contracts/src/orchestration.ts), and [authentication model](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md). Contract/authentication failures are surfaced without response bodies or credentials. See [the acceptance record](docs/acceptance/nor-173.md) for verified behavior and remaining live validation. Automated checks alone do not establish v1 readiness.
+T3Code is not version-pinned. Settings, provider and branch reads use authenticated WebSocket RPCs. Bootstrap commands also use WebSocket RPC: the tested HTTP dispatch endpoint does not run bootstrap preparation. The adapter follows its authenticated [HTTP contract](https://github.com/pingdotgg/t3code/blob/main/packages/contracts/src/environmentHttp.ts), [orchestration contract](https://github.com/pingdotgg/t3code/blob/main/packages/contracts/src/orchestration.ts), and [authentication model](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md). Contract/authentication failures are surfaced without response bodies or credentials. See [NOR-198 API validation](docs/acceptance/nor-198.md) for settings/worktree compatibility and [the original acceptance record](docs/acceptance/nor-173.md) for broader workflow evidence. Automated checks alone do not establish v1 readiness.
