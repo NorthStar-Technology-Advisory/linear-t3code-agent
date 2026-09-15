@@ -1,5 +1,13 @@
 # Changelog
 
+## NOR-197 — status-driven workflows
+
+- Select grilling, specification, tickets or implementation through team status-description markers and explicit delegation.
+- Preserve planning context, start fresh implementation conversations, stop superseded stages and retain workspace/PR state.
+- Publish and reconcile native Linear artifacts with durable identities; retain Q&A and revision summaries in parent comments.
+- Verify installed workspace skills, refresh parent/child context and distinguish planning completion from implementation delivery.
+- Document operator setup, human progression and recovery; see the NOR-197 acceptance record for live coverage limits.
+
 ## Unreleased
 
 ### NOR-173: Linear ↔ T3Code bridge

@@ -5,6 +5,8 @@ import { linearGraphql, createAgentActivity, getAccessToken, type AgentActivityC
 export type IssueContext = {
   id: string; identifier: string; title: string; description: string | null; url: string;
   project: { id: string } | null; team: { id: string };
+  state: { id: string; description: string | null; team: { id: string }; type: string };
+  delegate: { id: string } | null; parent: { id: string } | null; delegated: boolean;
 };
 type Comment = { id: string; body: string; createdAt: string; user: { name: string } | null; externalUser?: { name: string } | null; botActor?: { name: string } | null };
 type Attachment = { id: string; title: string; url: string; bodyData?: string | null };
@@ -13,6 +15,7 @@ type Connection<T> = { nodes: T[]; pageInfo: { hasNextPage: boolean; endCursor?:
 export type ContextInventory = { source: string; status: "supplied" | "unavailable" | "externally delegated"; detail: string }[];
 export type CollectedContext = { text: string; fingerprint: string; inventory: ContextInventory; unavailable: string[] };
 const fields = {
+  children: "id identifier title description url state { id type description team { id } } delegate { id } parent { id } project { id } team { id }",
   comments: "id body createdAt user { name } externalUser { name } botActor { name }",
   attachments: "id title url bodyData",
   relations: "type relatedIssue { id url }",
@@ -25,9 +28,9 @@ export class LinearClient {
     return linearGraphql<T>(query, variables, { endpoint: this.endpoint, tokenPath: this.tokenPath });
   }
   async issue(id: string): Promise<IssueContext> {
-    const data = await this.query<{ issue: IssueContext | null }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id } team { id } } }`, { id });
+    const data = await this.query<{ issue: IssueContext | null; viewer: { id: string } }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id } team { id } state { id description type team { id } } delegate { id } parent { id } } viewer { id } }`, { id });
     if (!data.issue) throw new Error("Linear issue is unavailable; restore access and resume.");
-    return data.issue;
+    return { ...data.issue, delegated: Boolean(data.issue.delegate && data.issue.delegate.id === data.viewer?.id) };
   }
   async projectTitle(projectId: string | undefined): Promise<string> {
     const correction = 'Configure the Linear project label group "T3Code project" with exactly one selected child whose name matches a T3Code project title, then send resume.';
@@ -91,13 +94,14 @@ export class LinearClient {
       const relations = await read<Relation>("relations");
       const inverse = await read<Relation>("inverseRelations");
       const related = [...relations, ...inverse].map(r => r.relatedIssue ?? r.issue).filter(r => r !== undefined);
-      const doc = { issue: current, comments, attachments, furtherLinks: related };
+      const children = await read<IssueContext>("children");
+      const doc = { issue: current, comments, attachments, children, furtherLinks: related };
       documents.push(doc);
       for (const match of JSON.stringify(doc).matchAll(/https?:\/\/[^\s"<>\\]+/g)) urls.add(match[0].replace(/[),.;]+$/, ""));
       for (const attachment of attachments) {
         if (attachment.bodyData) inventory.push({ source: attachment.url, status: "supplied", detail: `Attachment body: ${attachment.title}` });
       }
-      return root ? related.map(r => r.id) : [];
+      return root ? [...related.map(r => r.id), ...(current.parent ? [current.parent.id] : []), ...children.map(child => child.id)] : [];
     };
     const relatedIds = await collect(issue, true);
     for (const id of new Set(relatedIds.filter(id => id !== issue.id))) {
@@ -136,6 +140,13 @@ export class LinearClient {
     const file = path.join(directory, createHash("sha256").update(url.href).digest("hex") + suffix);
     await writeFile(file, Buffer.concat(chunks), { mode: 0o600 });
     return file;
+  }
+
+  async comment(issueId: string, body: string, id: string): Promise<void> {
+    const data = await this.query<{ issue: { comments: { nodes: Array<{ id: string }> } } }>(`query BridgeArtifactComment($id: String!, $commentId: ID!) { issue(id: $id) { comments(filter: { id: { eq: $commentId } }, first: 1) { nodes { id } } } }`, { id: issueId, commentId: id });
+    if (data.issue.comments.nodes.some(c => c.id === id)) return;
+    const result = await this.query<{ commentCreate: { success: boolean } }>(`mutation BridgeArtifactCommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`, { input: { id, issueId, body } });
+    if (!result.commentCreate.success) throw new Error("Linear discussion publication failed; retry will reconcile its retained identity.");
   }
 
   async activity(sessionId: string, content: AgentActivityContent, id: string, reconcile = false) {

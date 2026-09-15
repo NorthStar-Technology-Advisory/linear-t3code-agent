@@ -1,3 +1,5 @@
+import { preparePublication, publishNext, type Publication, type ArtifactIdentities } from "./artifacts.js";
+import { selectWorkflow, workflowGate, type Stage } from "./workflow.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { writeFile, realpath } from "node:fs/promises";
@@ -6,7 +8,7 @@ import { BridgeStore } from "./bridge-store.js";
 import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient } from "./linear-context.js";
 import { prepareCheckout, git, type Route } from "./repository.js";
-import { deliveryInstructions, deliveryResult } from "./delivery.js";
+import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
@@ -20,8 +22,13 @@ const WebhookSchema = z.object({
 type Webhook = z.infer<typeof WebhookSchema>;
 type QueuedTurn = { id: string; body: string };
 type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
+type SavedThread = { threadId: string; created: boolean; sequence: number; seenActivities: string[] };
 type Session = {
   id: string; workspaceId: string; issueId: string; teamId?: string;
+  artifactParentId?: string;
+  publication?: Publication; publicationHistory?: Publication[]; artifacts?: ArtifactIdentities;
+  stage?: Stage; previousWorkflow?: Stage["workflow"]; planningThread?: SavedThread; implementationThreads?: SavedThread[];
+  gate?: string; gateRevision?: number; gateDirty?: boolean; transition?: boolean; retiredRequests?: string[];
   threadId: string; branch: string; worktree: string | null; route?: Route;
   status: "queued" | "running" | "paused" | "cancelled" | "cancelling" | "idle" | "closed";
   queue: QueuedTurn[]; command?: RunnerCommand;
@@ -33,7 +40,7 @@ type Session = {
   sequence: number; seenActivities: string[]; createdAt: string; updatedAt: string;
   lastReportAt: number; lastError?: string; contextFingerprint?: string;
 };
-type Outbound = { attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
+type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
 type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
@@ -52,6 +59,22 @@ export class Bridge {
   start() { this.timer ??= setInterval(() => { void this.tick().catch(() => console.error("bridge tick failed; check durable storage")); }, this.options.pollMs); }
   async close() { clearInterval(this.timer); await this.ticking; this.store.close(); }
   accept(input: unknown): void {
+    if (typeof input === "object" && input !== null && "type" in input && input.type === "Issue") {
+      const event = z.object({ action: z.string(), organizationId: z.string(), data: z.object({ id: z.string(), updatedAt: z.string() }), updatedFrom: z.record(z.unknown()).optional() }).parse(input);
+      if (event.action !== "update" || !event.updatedFrom || !("stateId" in event.updatedFrom || "delegateId" in event.updatedFrom)) return;
+      this.store.update(state => {
+        if (state.workspaceId && state.workspaceId !== event.organizationId) throw new Error("Workspace does not match this installation.");
+        const key = `${event.organizationId}:issue:${event.data.id}:${event.data.updatedAt}:${JSON.stringify(event.updatedFrom)}`;
+        if (state.deliveries.includes(key)) return;
+        state.deliveries.push(key);
+        for (const session of Object.values(state.sessions)) {
+          if (session.issueId !== event.data.id || session.status === "closed") continue;
+          session.gateDirty = true;
+          session.gateRevision = (session.gateRevision ?? 0) + 1;
+        }
+      });
+      return;
+    }
     const payload = WebhookSchema.parse(input);
     const id = payload.agentSession.id;
     const activityId = payload.agentActivity?.id;
@@ -81,8 +104,14 @@ export class Bridge {
       }
       const body = payload.agentActivity?.content?.body?.trim().toLowerCase();
       if (payload.agentActivity?.signal === "stop" || ["stop", "cancel", "cancelled", "canceled"].includes(body ?? "")) {
+        delete session.transition;
         this.requestCancellation(session);
-        state.outbox = state.outbox.filter(o => o.sessionId !== id);
+        state.outbox = state.outbox.filter(o => o.sessionId !== id || o.issueId);
+        return;
+      }
+      if (body === "resume" && session.status === "cancelling" && session.transition) {
+        delete session.stopSent; delete session.cancelCommand;
+        this.report(state, session, "thought", "Retrying provider stop for the stage transition. The next stage still waits for confirmed stop.");
         return;
       }
       if (body === "resume" && session.status === "paused") {
@@ -124,8 +153,15 @@ export class Bridge {
         if ((!request.response || request.responseUnconfirmed) && !session.responses.some(r => r.requestId === request.id)) {
           request.responseUnconfirmed = false;
           session.responses.push(command);
+          this.discussion(state, session, `Human response to ${request.id}:\n${reply}`);
         }
         return;
+      }
+      if (session.status === "paused" && session.publication?.blocked) {
+        (session.publicationHistory ??= []).push(session.publication);
+        delete session.publication; delete session.active; delete session.command;
+        session.status = "queued";
+        this.report(state, session, "thought", "Conflicting publication preserved in history. Revising the current stage using refreshed Linear artifacts and your feedback.");
       }
       session.queue.push({ id: randomUUID(), body: this.prompt(payload) });
       if (session.status === "idle" || session.status === "cancelled") session.status = "queued";
@@ -135,7 +171,11 @@ export class Bridge {
   private prompt(payload: Webhook) {
     return [payload.agentActivity?.content?.body, payload.promptContext, ...(payload.guidance ?? []).map(g => g.body)].filter(Boolean).join("\n\n");
   }
+  private discussion(state: State, session: Session, body: string) {
+    if (session.stage && session.stage.workflow !== "implement") state.outbox.push({ id: randomUUID(), sessionId: session.id, issueId: session.artifactParentId ?? session.issueId, type: "thought", body: redact(body) });
+  }
   private report(state: State, session: Session, type: Outbound["type"], body: string) {
+    if (type === "elicitation") this.discussion(state, session, body);
     const clean = redact(body);
     const chunks = clean.match(/[\s\S]{1,8000}/gu) ?? [""];
     for (let i = 0; i < chunks.length; i++) state.outbox.push({ id: randomUUID(), sessionId: session.id,
@@ -154,14 +194,15 @@ export class Bridge {
       try {
         if (!this.store.read().outbox.some(o => o.id === outgoing.id)) continue;
         this.store.update(s => { s.outbox.find(o => o.id === outgoing.id)!.attempted = true; });
-        await this.options.linear.activity(outgoing.sessionId, { type: outgoing.type, body: redact(outgoing.body) }, outgoing.id, outgoing.attempted);
+        if (outgoing.issueId) await this.options.linear.comment(outgoing.issueId, redact(outgoing.body), outgoing.id);
+        else await this.options.linear.activity(outgoing.sessionId, { type: outgoing.type, body: redact(outgoing.body) }, outgoing.id, outgoing.attempted);
         this.store.update(s => { s.outbox = s.outbox.filter(o => o.id !== outgoing.id); });
       } catch { console.error("Linear activity delivery failed; update retained", { agentSessionId: outgoing.sessionId, activityId: outgoing.id }); break; }
     }
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];
     for (const session of Object.values(this.store.read().sessions)) {
-      if (session.status === "running" || session.status === "cancelling" || (session.status === "paused" && session.active)) eligible.push(session.id);
+      if (session.status !== "closed" && session.gateDirty || session.status === "running" || session.status === "cancelling" || (session.status === "paused" && session.active)) eligible.push(session.id);
       else if (session.status === "queued" && (session.active || running < this.options.concurrency)) {
         this.store.update(s => { s.sessions[session.id].status = "running"; });
         if (!session.active) running++; eligible.push(session.id);
@@ -178,6 +219,7 @@ export class Bridge {
           session.lastError = message;
           if (error instanceof IntegrationError && !error.retryable && session.status !== "cancelling") {
             if (session.status !== "paused" || changed) this.report(state, session, "error", "Integration requires attention. Work is preserved and paused; repair the configuration or adapter, then send resume.");
+            if (session.publication) session.publication.blocked = true;
             session.status = "paused";
           }
         });
@@ -185,6 +227,7 @@ export class Bridge {
     }));
   }
   private requestCancellation(session: Session) {
+    session.retiredRequests = [...(session.retiredRequests ?? []), ...session.requests.map(r => r.id)];
     session.generation++;
     session.cancelHadActive = Boolean(session.active);
     session.status = "cancelling";
@@ -233,6 +276,7 @@ export class Bridge {
       if (reconciled) session.requests = [];
       const newActivities = thread.activities.filter(a => !session.seenActivities.includes(a.id));
       for (const activity of reconciled ? thread.activities : newActivities) {
+        if (session.retiredRequests?.includes(String(activity.payload?.requestId))) continue;
         if (!session.seenActivities.includes(activity.id)) session.seenActivities.push(activity.id);
         const requestId = activity.payload?.requestId;
         if (typeof requestId === "string" && /^(approval|user-input)\.resolved$/.test(activity.kind)) {
@@ -327,6 +371,21 @@ export class Bridge {
     }
     this.store.update(s => {
       const current = s.sessions[session.id];
+      if (current.transition) {
+        if (snapshot) {
+          current.seenActivities = [...new Set([...current.seenActivities, ...snapshot.thread.activities.map(a => a.id)])];
+          current.retiredRequests = [...new Set([...(current.retiredRequests ?? []), ...snapshot.thread.activities.flatMap(a => typeof a.payload?.requestId === "string" ? [a.payload.requestId] : [])])];
+        }
+        if (current.publication) { (current.publicationHistory ??= []).push(current.publication); delete current.publication; }
+        current.previousWorkflow = current.stage?.workflow ?? current.previousWorkflow;
+        delete current.stage;
+        current.status = "queued";
+        current.queue = [{ id: randomUUID(), body: "Execute the stage selected by the current Linear status. Read refreshed artifacts and reconcile existing work before proceeding." }];
+        current.created = Boolean(snapshot);
+        delete current.active; delete current.command; delete current.cancelCommand; delete current.interrupted; delete current.stopSent; delete current.transition;
+        this.report(s, current, "thought", "Previous stage stopped. Its questions and queued replies are inactive; conversation, artifacts, branch and files are preserved. Rechecking current status and delegation before the next stage.");
+        return;
+      }
       const ended = current.route?.workspaceMode === "local";
       current.status = ended ? "closed" : current.queue.length ? "queued" : "cancelled";
       if (ended) current.queue = [];
@@ -344,9 +403,30 @@ export class Bridge {
     if (session.pr && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) {
       if (await this.checkPr(session)) return;
     }
-    if (session.status !== "running" && !(session.status === "paused" && session.active)) return;
     const generation = session.generation;
-    const stillCurrent = () => this.session(id).generation === generation;
+    const gateRevision = session.gateRevision ?? 0;
+    const stillCurrent = () => this.session(id).generation === generation && (this.session(id).gateRevision ?? 0) === gateRevision;
+    const gateIssue = await this.options.linear.issue(session.issueId);
+    if (!stillCurrent()) return;
+    const gate = workflowGate(gateIssue);
+    this.store.update(s => { s.sessions[id].gateDirty = false; });
+    if ((session.gate !== undefined && session.gate !== gate) || (session.gate === undefined && session.created && !session.stage)) {
+      this.store.update(s => {
+        const current = s.sessions[id];
+        current.gate = gate;
+        if (!current.stage && !current.previousWorkflow && current.created) current.previousWorkflow = "implement";
+        this.requestCancellation(current);
+        current.transition = true;
+        s.outbox = s.outbox.filter(o => o.sessionId !== id || o.issueId);
+      });
+      return;
+    }
+    this.store.update(s => { s.sessions[id].gate = gate; });
+    if (!gateIssue.delegated || (!session.stage && !selectWorkflow(gateIssue))) {
+      this.store.update(s => { s.sessions[id].status = "idle"; s.sessions[id].queue = []; });
+      return;
+    }
+    if (session.status !== "running" && !(session.status === "paused" && session.active)) return;
 
     if (!session.route) {
       const issue = await this.options.linear.issue(session.issueId);
@@ -370,6 +450,25 @@ export class Bridge {
           s.sessions[id].worktree = null;
         }
         s.sessions[id].route = route; s.sessions[id].teamId = issue.team.id;
+      });
+      session = this.session(id);
+    }
+    if (!session.stage) {
+      const workflow = selectWorkflow(gateIssue)!;
+      const skillPath = await this.options.runner.skill(workflow, session.worktree ?? session.route!.repository, session.route!.modelSelection.instanceId);
+      if (!stillCurrent()) return;
+      this.store.update(s => {
+        const current = s.sessions[id];
+        const saved = { threadId: current.threadId, created: current.created, sequence: current.sequence, seenActivities: current.seenActivities };
+        if (current.previousWorkflow && current.previousWorkflow !== "implement") current.planningThread = saved;
+        if (workflow === "implement" && current.previousWorkflow && current.previousWorkflow !== "implement") {
+          Object.assign(current, { threadId: randomUUID(), created: false, sequence: 0, seenActivities: [] });
+        } else if (workflow !== "implement" && current.previousWorkflow === "implement") {
+          (current.implementationThreads ??= []).push(saved);
+          Object.assign(current, current.planningThread ?? { threadId: randomUUID(), created: false, sequence: 0, seenActivities: [] });
+        }
+        current.artifactParentId = gateIssue.parent?.id ?? gateIssue.id;
+        current.stage = { id: randomUUID(), workflow, statusId: gateIssue.state.id, teamId: gateIssue.team.id, skillPath };
       });
       session = this.session(id);
     }
@@ -455,6 +554,29 @@ export class Bridge {
       this.store.update(s => { delete s.sessions[id].command; });
       return;
     }
+    if (session.publication) {
+      if (paused) return;
+      const adoptedRelationId = await publishNext(this.options.linear, session.publication);
+      if (!stillCurrent()) return;
+      this.store.update(s => {
+        const current = s.sessions[id];
+        const publication = current.publication!;
+        const operation = publication.operations[publication.cursor];
+        for (const [key, relationId] of Object.entries(current.artifacts?.relations ?? {})) {
+          if (relationId !== operation.id) continue;
+          if (operation.kind === "removeRelation") delete current.artifacts!.relations[key];
+          else if (adoptedRelationId) current.artifacts!.relations[key] = adoptedRelationId;
+        }
+        publication.cursor++;
+        if (publication.cursor >= publication.operations.length) {
+          (current.publicationHistory ??= []).push(publication);
+          delete current.publication; delete current.active; delete current.command;
+          current.status = current.queue.length ? "queued" : "idle";
+          this.report(s, current, "response", `${publication.report}\n\nLinear artifacts published. ${publication.review.join("\n")}\nWaiting for human direction; status unchanged.`);
+        }
+      });
+      return;
+    }
     if (session.active) {
       if (session.requests.length) return;
       const latest = snapshot.thread.latestTurn;
@@ -462,17 +584,25 @@ export class Bridge {
         this.store.update(s => { s.sessions[id].active!.turnId = latest.turnId; s.sessions[id].sequence = snapshot.sequence; });
         if (latest.state !== "running") {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
-          const result = deliveryResult(summary);
-          const pr = await this.options.pullRequests.find(session.route!, session.branch);
+          const planning = session.stage!.workflow !== "implement";
+          const result = deliveryResult(summary, session.stage!.workflow);
+          if (planning && result.complete && latest.state === "completed" && !paused) {
+            const issue = await this.options.linear.issue(session.issueId);
+            const prepared = await preparePublication(this.options.linear, issue, session.stage!.id, result.artifacts, result.summary!, result.body, session.artifacts ?? { children: {}, relations: {} });
+            if (!stillCurrent()) return;
+            this.store.update(s => { s.sessions[id].publication = prepared.publication; s.sessions[id].artifacts = prepared.identities; });
+            return;
+          }
+          const pr = planning ? null : await this.options.pullRequests.find(session.route!, session.branch);
           if (!stillCurrent()) return;
           this.store.update(s => {
             const current = s.sessions[id];
             current.pr = pr ?? current.pr;
             delete current.active;
-            const success = latest.state === "completed" && result.complete && pr?.state === "OPEN" && pr.isDraft;
+            const success = latest.state === "completed" && result.complete && (planning || (pr?.state === "OPEN" && pr.isDraft));
             current.status = success && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
             delete current.command;
-            const prReport = pr ? `PR: ${pr.url} (${pr.state}, ${pr.isDraft ? "draft" : "not draft"})` : "No draft PR found; delivery is incomplete.";
+            const prReport = planning ? "Stage finished. Waiting for human direction; status unchanged." : pr ? `PR: ${pr.url} (${pr.state}, ${pr.isDraft ? "draft" : "not draft"})` : "No draft PR found; delivery is incomplete.";
             this.report(s, current, success ? "response" : "error", `${prReport}\n\n${result.body}${success && paused ? "\n\nQueued prompts remain paused after an integration failure; send resume or cancel." : success ? "" : `\n\nT3Code turn ${latest.state}. Queued prompts are preserved and paused; send resume or cancel.`}`);
           });
         }
@@ -486,24 +616,36 @@ export class Bridge {
         this.store.update(s => { s.sessions[id].status = "paused"; this.report(s, s.sessions[id], "error", "Worktree setup remains unconfirmed. Inspect and complete or repair setup in T3Code, then send resume."); });
         return;
       }
-      if (await this.checkPr(session)) return;
+      if (session.stage?.workflow === "implement" && await this.checkPr(session)) return;
       if (!stillCurrent()) return;
       const issue = await this.options.linear.issue(session.issueId);
       const directory = path.resolve(this.options.worktreeRoot, "context", session.threadId);
       const context = await this.options.linear.context(issue, directory);
+      if (session.stage!.workflow !== "grill-me" && issue.parent) {
+        const parent = await this.options.linear.issue(issue.parent.id);
+        if (!parent.description?.trim() || context.unavailable.some(source => source === `Linear issue ${parent.id}` || source === `${parent.url}#comments` || source === `${parent.url}#children` || source === `${parent.url}#relations` || source === `${parent.url}#inverseRelations`)) throw new IntegrationError("Required parent specification or decision/dependency context is unavailable. Restore access and send resume.", false);
+      }
+      if (session.stage!.workflow === "to-tickets" && !issue.description?.trim()) throw new IntegrationError("A parent specification is required before ticket creation. Publish/review the specification and send resume.", false);
       const contextFile = path.join(directory, `${context.fingerprint}.json`);
       await writeFile(contextFile, context.text, { mode: 0o600 });
       const contextChange = session.contextFingerprint ? (session.contextFingerprint === context.fingerprint ? "Context unchanged." : "Context changed since the previous turn; read the refreshed material.") : "Initial context.";
       const contextText = context.text.length < 80_000 ? context.text : `Complete context (${context.text.length} characters) is supplied in ${contextFile}. Read this file in full before acting; no content was truncated.`;
       if (!stillCurrent()) return;
       const turn = session.queue[0];
-      let text = `${deliveryInstructions}\n\n${contextChange}\n${contextText}\n\n${turn.body}`;
+      const instructions = `${workflowInstructions(session.stage!)}\nRetained artifact identities: ${JSON.stringify(session.artifacts ?? { children: {}, relations: {} })}`;
+      let text = `${instructions}\n\n${contextChange}\n${contextText}\n\n${turn.body}`;
       if (text.length > 100_000) {
         const turnFile = path.join(directory, `${turn.id}.txt`);
         await writeFile(turnFile, text, { mode: 0o600 });
-        text = `${deliveryInstructions}\n\nRead the complete delegated turn at ${turnFile} before acting. Its context and follow-up exceed the transport input limit; the file preserves them in full.`;
+        text = `${instructions}\n\nRead the complete delegated turn at ${turnFile} before acting. Its context and follow-up exceed the transport input limit; the file preserves them in full.`;
       }
       if (!stillCurrent()) return;
+      const launchIssue = await this.options.linear.issue(session.issueId);
+      if (!stillCurrent()) return;
+      if (workflowGate(launchIssue) !== gate) {
+        this.store.update(s => { s.sessions[id].gateDirty = true; });
+        return;
+      }
       const command: RunnerCommand = {
         type: "thread.turn.start", commandId: randomUUID(), threadId: session.threadId,
         message: { messageId: turn.id, role: "user", text, attachments: [] },

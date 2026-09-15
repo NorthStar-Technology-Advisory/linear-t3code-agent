@@ -2,7 +2,7 @@
 
 A fork of [hiasinho/linear-pi-agent](https://github.com/hiasinho/linear-pi-agent), adapted to connect Linear Agent Sessions to an existing [T3Code](https://github.com/pingdotgg/t3code) environment.
 
-Delegate a Linear issue to the app and follow its progress in Linear. The coding agent implements and tests the task, pushes a branch, and opens a draft GitHub PR for human review. Each Linear Agent Session gets its own T3Code thread and task branch, using the workspace mode configured in T3Code. Follow-ups continue in that session and update its open PR. The bridge never merges PRs.
+Delegate a Linear issue to the app and select its workflow using a marker in its team status description. Grilling, specification and ticket creation share a planning conversation and publish artifacts in Linear. Implementation starts a fresh conversation, tests the work and delivers a draft GitHub PR. Humans review each output and move the issue to request the next stage. The bridge never advances statuses, delegates children or merges PRs.
 
 ## What changed from linear-pi-agent
 
@@ -12,9 +12,9 @@ The original project connects Linear to the Pi coding agent. This fork retains i
 | --- | --- |
 | Coding runtime | Your running T3Code environment and its configured providers/models |
 | Repository selection | A Linear project label matching an active T3Code project title |
-| Session isolation | One thread and branch per session; new worktree or reserved current checkout |
+| Session isolation | Preserved planning conversation; fresh implementation threads; shared session branch/workspace |
 | Recovery | SQLite-backed queues, command identities, pending requests and event replay positions |
-| Delivery | Draft GitHub PRs, validation reports and follow-ups on the same PR |
+| Delivery | Linear planning artifacts; implementation draft PRs and validation reports |
 | Pi configuration | No Pi executable or SDK required; `PI_*` settings are not used |
 
 The bridge runs as a separate service and checkout from the application repositories it modifies. T3Code owns the coding execution; the bridge handles Linear communication, routing and delivery tracking.
@@ -141,6 +141,43 @@ Create a disposable repository and an issue in a labelled Linear project. Delega
 
 Use your own process supervisor for ongoing operation. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
 
+## Status-driven workflows
+
+In **Settings → Teams → your team → Issue statuses → Edit**, add exactly one standalone marker to the status description. Ordinary prose can surround it:
+
+```text
+Ready to challenge assumptions and clarify requirements.
+
+t3code: grill-me
+```
+
+| Marker | Required operator-installed skill | Output |
+| --- | --- | --- |
+| `t3code: grill-me` | `grill-me` | Parent comments containing Q&A, decisions and uncertainty |
+| `t3code: to-spec` | `to-spec` | Current specification in the parent issue description |
+| `t3code: to-tickets` | `to-tickets` | Reviewed native Linear children, acceptance criteria and blocking links |
+| `t3code: implement` | `implement` | Validated work and a reviewable draft PR |
+
+Markers are case-sensitive, with exactly one space after the colon; surrounding whitespace is allowed. Multiple markers, unsupported references or malformed marker lines pause with correction instructions. Unmarked statuses are holding/review states. Selection uses the actual team and status IDs, never their names. This configuration applies across the team's projects and cannot override routing, models or permissions.
+
+Install and maintain these skills in the selected provider's T3Code execution environment. The bridge checks the provider's workspace skill catalog through `server.refreshProviders` before starting a stage; disabled, non-user-invocable, missing or ambiguous skills block execution. It does not install or synchronize skills. It invokes the installed skill and preserves its review requirements. Linear publication instructions override target-repository tracker defaults for these workflows.
+
+Both delegation to the installed app and a marked status are required. Initial delegation starts the selected stage. Later Issue state/delegate updates cause a fresh current-state check; unrelated board movement cannot create a session. Subscribe the OAuth webhook to **Issue updates as well as Agent Session events**. Editing a status description alone does not start work or change an active stage. New invocations resolve the current marker and skill. Follow-ups retain the current stage and refresh Linear context.
+
+Humans move the parent forward or backward among planning stages. These transitions reuse its planning thread. Delegating a child starts a fresh implementation thread with the current ticket, parent specification, decisions and dependencies. Small issues can enter implementation directly; moving from planning into implementation on the same issue also starts fresh while retaining its branch, workspace and PR state. Returning to planning restores its saved conversation. Implementation follow-ups reuse the current implementation thread and open PR.
+
+A stage change, move to an unmarked status or removal of delegation stops execution first. Old questions, responses and queued prompts become inactive. The bridge confirms provider stop, then rechecks current status/delegation so rapid moves cannot launch intermediate stages. A failed transition stop retains capacity and checkout ownership; repair T3Code and send `resume` to retry the stop. Explicit `cancel` retains its existing terminal current-checkout behavior. `resume` cannot bypass the status/delegation gate or reopen an ended session.
+
+### Artifacts and revisions
+
+The parent description is the authoritative brief/specification. Parent comments retain grilling discussions and revision summaries. Children contain scope, acceptance criteria and a source-spec link; no duplicate full specification is needed. Planning requires no code changes, validation command, PR, repository Markdown, GitHub tickets or separate Linear document.
+
+The installed skill returns structured publication content to the bridge after any required human review. The bridge publishes it with durable operation and child identities, verifies/reconciles writes, then reports completion. Child creation does not delegate work. Stable child keys are reused on re-entry. Unstarted children and their blocking links are reconciled; active, completed or delegated children retain their commitments and get proposed changes reported for human review. Omitted children are preserved and identified as possibly stale.
+
+If a human changes an artifact while publication is pending, the bridge pauses rather than overwrite the change. Send revision feedback to start a refreshed turn in the current stage; the failed publication stays in history. Connection failures retry the retained operation after reading its remote identity/content, so a lost acknowledgement does not create a replacement artifact. Do not clear the database to repair publication. An interrupted publication may be partially applied; the next stage reads current artifacts and receives their retained identities.
+
+Completing a stage never moves the board. Planning completion requires its actual Linear output; implementation still requires honest validation and a draft PR. See [NOR-197 acceptance](docs/acceptance/nor-197.md) for verified behavior and live acceptance prerequisites.
+
 ## Routing and permissions
 
 The bridge reads the selected child of the **T3Code project** project label group and matches its name exactly, case-sensitively, against active T3Code project titles. Deleted projects are excluded. Missing projects/groups/selections, multiple groups or selections, unknown titles and duplicate matching titles pause the session before execution. Duplicate-title errors list the matching workspace paths. Correct the labels or T3Code configuration, then send `resume`. Duplicate webhook delivery and ordinary follow-ups do not retry failed initial resolution.
@@ -180,11 +217,11 @@ Only explicit approval commands grant approval. Other messages stay queued. `sto
 
 ## Context and delivery
 
-Before every turn, the bridge fetches the issue, all paginated text comments with authors/dates, attachment bodies, and directly related issues with their comments and attachments. Further relationships are recorded without recursively traversing the graph. Linear-hosted uploads are downloaded with OAuth into private context files. Downloads are limited to 50 MiB each; failures and limits appear in the inventory as unavailable. Credentials are never forwarded to external URLs or redirects.
+Before every turn, the bridge fetches the issue, its parent and children, all paginated text comments with authors/dates, attachment bodies, and directly related issues with their comments and attachments. Further relationships are recorded without recursively traversing the graph. Linear-hosted uploads are downloaded with OAuth into private context files. Downloads are limited to 50 MiB each; failures and limits appear in the inventory as unavailable. Credentials are never forwarded to external URLs or redirects.
 
 External links are supplied to T3Code for retrieval through its authorized tools. They are explicitly marked unread by the bridge. Large context is supplied as a complete private JSON file rather than truncated. T3Code is instructed to read supplied files and maintain an inventory of read, summarized and unavailable sources. T3Code evaluates which specific sources are required using the issue and latest explicit clarifications. It must ask a question before implementation when required material is missing; if native questions are unavailable, it must report incomplete work and wait for clarification. Optional unavailable material does not automatically block an unrelated reading requirement.
 
-The agent returns a structured result with validation commands, outcomes, blockers and context access. The bridge checks for the session branch's draft PR through `gh`. Missing validation, failed/unavailable checks, blockers or a missing draft are reported as incomplete, with the PR link when available. Validation is identified as **reported by T3Code**. Same-session follow-ups update the existing PR. Once it closes or merges, further implementation requires a new delegation.
+For implementation, the agent returns a structured result with validation commands, outcomes, blockers and context access. The bridge checks for the session branch's draft PR through `gh`. Missing validation, failed/unavailable checks, blockers or a missing draft are reported as incomplete, with the PR link when available. Validation is identified as **reported by T3Code**. Same-session follow-ups update the existing PR. Once it closes or merges, further implementation requires a new delegation.
 
 On PR closure or merge, active execution is stopped first. Current-checkout sessions release their reservation and preserve all checkout files and the task branch; worktree-removal cleanup never targets the current checkout. For worktree sessions, the bridge removes the worktree only when it is clean and its commits are reachable from freshly fetched origin refs. Dirty, untracked, unpushed, unverifiable and squash-merge cases are preserved conservatively and reported. Branches and session mappings remain. Ignored local files are checked explicitly and also preserve the worktree; git can otherwise delete them even without force.
 

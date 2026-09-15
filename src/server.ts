@@ -128,7 +128,7 @@ export function createApp(bridge?: Bridge) {
       }
 
       if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "invalid_payload" });
-      if (payload.type === "AgentSessionEvent") {
+      if ((payload.type === "AgentSessionEvent" || payload.type === "Issue")) {
         if (!bridge) return res.status(503).json({ ok: false, error: "bridge_unavailable" });
         try { bridge.accept(payload); }
         catch (error) {
@@ -137,7 +137,7 @@ export function createApp(bridge?: Bridge) {
         }
       }
 
-      return res.status(200).json({ ok: true, accepted: payload.type === "AgentSessionEvent" });
+      return res.status(200).json({ ok: true, accepted: (payload.type === "AgentSessionEvent" || payload.type === "Issue") });
     },
   );
 

@@ -42,12 +42,16 @@ async function fixture(t: TestContext) {
   const attachmentRequests: string[] = [];
   const projects = [{ id: "t3-project", title: "Test project", workspaceRoot: repo, deletedAt: null as string | null, defaultModelSelection: { instanceId: "codex", model: "test-model" } as any, defaultThreadEnvMode: "worktree" as string | null }];
   const settings: any = { defaultModelSelection: { instanceId: "codex", model: "inherited-model" }, defaultThreadEnvMode: "worktree", newWorktreesStartFromOrigin: false, providerInstances: { codex: { enabled: true } }, providers: {} };
+  const skills = ["grill-me", "to-spec", "to-tickets", "implement"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, enabled: true }));
   const providers = [{ instanceId: "codex", enabled: true, installed: true, availability: "available", models: [{ slug: "test-model" }, { slug: "inherited-model" }] }];
   const labels = { groups: [{ id: "group", name: "T3Code project", isGroup: true, parent: null }], selected: [{ id: "label", name: "Test project", isGroup: false, parent: { id: "group" } }] };
   let sequence = 0;
   const issueOverrides: Record<string, any> = {};
   const reads: any[] = [];
-  const faults = { dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false };
+  const artifactWrites: any[] = [];
+  const comments: any[] = [];
+  const relations: any[] = [];
+  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -60,6 +64,26 @@ async function fixture(t: TestContext) {
     if (req.url === "/graphql") {
       assert.equal(req.headers.authorization, "Bearer linear-secret");
       const { query, variables } = JSON.parse(raw);
+      if (/mutation BridgeArtifact/.test(query)) {
+        artifactWrites.push({ query, variables });
+        const input = variables.input;
+        if (query.includes("BridgeArtifactUpdate")) issueOverrides[variables.id] = { ...issueOverrides[variables.id], ...input };
+        if (query.includes("BridgeArtifactCreate")) issueOverrides[input.id] = { ...input, parent: { id: input.parentId }, state: { type: "unstarted" }, delegate: null };
+        if (query.includes("BridgeArtifactCommentCreate")) { if (!comments.some(c => c.id === input.id)) comments.push(input); }
+        if (query.includes("BridgeArtifactRelationDelete")) { const index = relations.findIndex(r => r.id === variables.id); if (index >= 0) relations.splice(index, 1); }
+        else if (query.includes("BridgeArtifactRelation")) { if (!relations.some(r => r.id === input.id)) relations.push(input); }
+        if (faults.dropArtifact) { faults.dropArtifact = false; res.destroy(); return; }
+        res.end(JSON.stringify({ data: { commentCreate: { success: true } } })); return;
+      }
+      if (query.includes("BridgeArtifactIssue")) {
+        res.end(JSON.stringify({ data: { issues: { nodes: issueOverrides[variables.id] ? [{ id: variables.id, ...issueOverrides[variables.id] }] : [] } } })); return;
+      }
+      if (query.includes("BridgeArtifactRelations")) {
+        res.end(JSON.stringify({ data: { issue: { inverseRelations: { pageInfo: { hasNextPage: false }, nodes: relations.filter(r => r.relatedIssueId === variables.id).map(r => ({ ...r, issue: { id: r.issueId } })) } } } })); return;
+      }
+      if (query.includes("BridgeArtifactComment")) {
+        res.end(JSON.stringify({ data: { issue: { comments: { nodes: comments.filter(c => c.id === variables.commentId) } } } })); return;
+      }
       if (query.includes("AgentActivityCreate")) {
         if (faults.linearDown) { res.statusCode = 503; res.end('{}'); return; }
         if (!activities.some(a => a.id === variables.input.id)) activities.push(variables.input);
@@ -74,7 +98,7 @@ async function fixture(t: TestContext) {
         res.end(JSON.stringify({ data: { project: { labels: { nodes: labels.selected, pageInfo: { hasNextPage: false } } } } }));
       } else {
         reads.push(variables);
-        res.end(JSON.stringify({ data: { issue: { id: "issue-1", identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
+        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: [], pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
       }
     } else {
       assert.equal(req.headers.authorization, "Bearer t3-secret");
@@ -135,6 +159,9 @@ async function fixture(t: TestContext) {
           socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: response.ok ? { _tag: "Success", value: await response.json() } : { _tag: "Failure", cause: { _tag: "Fail" } } }));
         }).catch(() => socket.close()); return;
       }
+      if (message.tag === "server.refreshProviders") {
+        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, workspaceSnapshots: [{ cwd: message.payload.cwd, skills }] })) } } })); return;
+      }
       if (message.tag === "server.getSettings" || message.tag === "server.getConfig") {
         socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: message.tag === "server.getSettings" ? settings : { providers } } })); return;
       }
@@ -179,7 +206,7 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify({ type: "AgentSessionEvent", webhookTimestamp: Date.now(), ...payload });
     return fetch(url + "/linear/webhook", { method: "POST", headers: { "content-type": "application/json", "linear-signature": signature ? createHmac("sha256", "webhook-secret").update(body).digest("hex") : "bad" }, body });
   };
-  return { projects, settings, providers, labels, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
+  return { artifactWrites, comments, relations, skills, projects, settings, providers, labels, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
     tick: async (n = 8) => { for (let i = 0; i < n; i++) await bridge.tick(); },
     restart: async () => { await close(app); await bridge.close(); bridge = new Bridge(options); app = createServer(createApp(bridge)); url = await listen(app); },
   };
@@ -389,7 +416,7 @@ test("missing prerequisites reach T3Code for clarification and explicit answers 
   await f.send(delegation()); await f.tick();
   const start = f.commands.find(c => c.type === "thread.turn.start");
   assert.ok(start);
-  assert.match(start.message.text, /required material is unavailable, pause.*before implementation/);
+  assert.match(start.message.text, /required material is unavailable, pause.*before stage execution/);
   const thread = [...f.threads.values()][0];
   thread.activities.push({ id: "prerequisite", kind: "user-input.requested", tone: "info", summary: "Comments are unavailable; are they required?", turnId: thread.latestTurn.turnId, payload: { requestId: "missing-comments", questions: [{ id: "required", question: "Are comments required?" }] } });
   await f.tick();
@@ -901,4 +928,240 @@ test("unavailable worktree files do not block provider cancellation", async t =>
   await f.send(followup("cancel", "cancel")); await f.tick();
   assert.ok(f.commands.some(c => c.type === "thread.session.stop"));
   assert.equal(thread.session.status, "stopped");
+});
+
+test("unmarked delegated status does not start a workflow", async t => {
+  const f = await fixture(t);
+  f.issueOverrides["issue-1"] = { state: { id: "review", description: "Human review", team: { id: "team-1" } }, delegate: { id: "app" } };
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.length, 0);
+});
+
+
+test("invalid status selections and missing skills fail before execution", async t => {
+  for (const description of ["t3code: unknown", "t3code: grill-me\nt3code: to-spec", "t3code: grill-me extra", "t3code: GRILL-ME", "t3code: grill-me"]) {
+    await t.test(description, async t => {
+      const f = await fixture(t);
+      f.skills.length = 0;
+      f.issueOverrides["issue-1"] = { state: { id: "planning", description, team: { id: "team-1" } } };
+      await f.send(delegation()); await f.tick();
+      assert.equal(f.commands.length, 0);
+      assert.ok(f.activities.some(a => a.content.type === "error" && /workflow|skill|marker/i.test(a.content.body)));
+    });
+  }
+});
+
+test("grilling completes without validation or PR and follow-ups retain selected skill after description edits", async t => {
+  const f = await fixture(t);
+  f.options.pullRequests.find = async () => null;
+  f.issueOverrides["issue-1"] = { state: { id: "planning", description: "t3code: grill-me", team: { id: "team-1" } } };
+  await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.latestTurn.state = "completed";
+  thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: "result", role: "assistant", turnId: thread.latestTurn.turnId, text: '<bridge-result>{"status":"complete","summary":"Decisions agreed","validation":[],"blockers":[],"context":{"read":["issue"],"summarized":[],"unavailable":[]}}</bridge-result>' });
+  await f.tick();
+  assert.ok(f.activities.some(a => a.content.type === "response" && /Decisions agreed/.test(a.content.body)));
+  f.issueOverrides["issue-1"].state.description = "t3code: implement";
+  await f.send(followup("revise", "Revisit the audience")); await f.tick();
+  const turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 2);
+  assert.equal(turns[1].threadId, turns[0].threadId);
+  assert.match(turns[1].message.text, /\$grill-me/);
+  assert.doesNotMatch(turns[1].message.text, /gh pr create/);
+});
+
+const statusEvent = (eventId: string) => ({ type: "Issue", action: "update", organizationId: "workspace-1", webhookId: eventId, data: { id: "issue-1", updatedAt: eventId }, updatedFrom: { stateId: "previous" } });
+function move(f: Awaited<ReturnType<typeof fixture>>, workflow: string, id = workflow) {
+  f.issueOverrides["issue-1"] = { ...f.issueOverrides["issue-1"], state: { id, description: workflow ? `t3code: ${workflow}` : "Review", team: { id: "team-1" }, type: "unstarted" } };
+}
+
+test("status transitions stop first, preserve planning conversation and workspace, and start fresh implementation", async t => {
+  const f = await fixture(t);
+  move(f, "grill-me");
+  await f.send(delegation()); await f.tick();
+  const first = [...f.threads.values()][0];
+  await writeFile(path.join(first.worktreePath, "preserved.txt"), "keep me");
+  f.faults.deferStop = true;
+  move(f, "to-spec"); await f.send(statusEvent("transition-1")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  assert.ok(f.commands.some(c => c.type === "thread.session.stop"));
+  move(f, "to-tickets"); await f.send(statusEvent("transition-2"));
+  await f.restart();
+  first.session = { status: "stopped", activeTurnId: null, lastError: null }; first.latestTurn.state = "interrupted";
+  await f.tick(14);
+  let turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 2);
+  assert.equal(turns[1].threadId, first.id);
+  assert.match(turns[1].message.text, /\$to-tickets/);
+  f.faults.deferStop = false;
+  move(f, "implement"); await f.send(statusEvent("transition-3")); await f.tick(14);
+  turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 3);
+  assert.notEqual(turns[2].threadId, first.id);
+  const implementation = f.threads.get(turns[2].threadId);
+  assert.equal(implementation.worktreePath, first.worktreePath);
+  assert.equal(implementation.branch, first.branch);
+  assert.equal(await readFile(path.join(first.worktreePath, "preserved.txt"), "utf8"), "keep me");
+  move(f, "grill-me"); await f.send(statusEvent("transition-4")); await f.tick(14);
+  turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.at(-1).threadId, first.id);
+  await f.send(statusEvent("transition-4")); await f.restart(); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 4);
+});
+
+test("spec completion requires a published parent specification", async t => {
+  const f = await fixture(t);
+  move(f, "to-spec"); await f.send(delegation()); await f.tick();
+  finish(f); await f.tick();
+  assert.ok(f.activities.some(a => a.content.type === "error" && /specification/i.test(a.content.body)));
+  assert.equal(f.activities.filter(a => a.content.type === "response").length, 0);
+});
+
+
+function planningResult(f: Awaited<ReturnType<typeof fixture>>, artifacts: object, summary = "Planning ready") {
+  const turn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  const thread = f.threads.get(turn.threadId);
+  thread.latestTurn.state = "completed"; thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: `result-${thread.latestTurn.turnId}`, role: "assistant", turnId: thread.latestTurn.turnId, text: `<bridge-result>${JSON.stringify({ status: "complete", summary, artifacts, validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}</bridge-result>` });
+}
+
+test("parent specification publication reconciles lost acknowledgement across restart", async t => {
+  const f = await fixture(t);
+  move(f, "to-spec"); await f.send(delegation()); await f.tick();
+  planningResult(f, { specification: { previousDescription: "Use https://example.org/design", description: "Original problem: design.\n\nAgreed specification with acceptance criteria." } });
+  f.faults.dropArtifact = true;
+  await f.tick(2); await f.restart(); await f.tick(12);
+  assert.match(f.issueOverrides["issue-1"].description, /Agreed specification/);
+  assert.equal(f.artifactWrites.filter(w => w.query.includes("BridgeArtifactUpdate")).length, 1);
+  assert.equal(f.comments.length, 1);
+  assert.ok(f.activities.some(a => a.content.type === "response" && /Planning ready/.test(a.content.body)));
+});
+
+test("ticket re-entry retains child identities, reconciles dependencies, and flags active children", async t => {
+  const f = await fixture(t);
+  move(f, "to-tickets"); await f.send(delegation()); await f.tick();
+  const child = (key: string, blockedBy: string[] = []) => ({ key, title: key, description: `Scope for ${key}`, acceptanceCriteria: [`${key} works`], blockedBy });
+  planningResult(f, { approved: true, children: [child("second", ["first"]), child("first")] });
+  await f.tick(20);
+  const created = f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate"));
+  assert.equal(created.length, 2);
+  assert.equal(f.relations.length, 1);
+  for (const c of created) {
+    assert.equal(c.variables.input.parentId, "issue-1");
+    assert.match(c.variables.input.description, /Acceptance criteria/);
+    assert.match(c.variables.input.description, /Source specification: https:\/\/linear.app/);
+    assert.equal(c.variables.input.delegateId, undefined);
+  }
+  const firstId = created.find(c => c.variables.input.title === "first").variables.input.id;
+  f.issueOverrides[firstId].state = { type: "started" };
+  move(f, "grill-me"); await f.send(statusEvent("tickets-back")); await f.tick(12);
+  move(f, "to-tickets"); await f.send(statusEvent("tickets-again")); await f.tick(12);
+  planningResult(f, { approved: true, children: [{ ...child("second"), description: "Revised scope" }, { ...child("first"), description: "Do not overwrite active work" }] });
+  await f.tick(20);
+  assert.equal(f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate")).length, 2);
+  assert.equal(f.relations.length, 0);
+  assert.doesNotMatch(f.issueOverrides[firstId].description, /Do not overwrite/);
+  assert.ok(f.comments.some(c => /Human review required/.test(c.body)));
+});
+
+test("moving to review or removing delegation retires unanswered questions and blocks resume", async t => {
+  const f = await fixture(t);
+  f.projects[0]!.defaultThreadEnvMode = "local";
+  move(f, "grill-me"); await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "question-activity", kind: "user-input.requested", summary: "Audience?", tone: "info", turnId: thread.latestTurn.turnId, payload: { requestId: "old-question", questions: [{ id: "audience", question: "Audience?" }] } });
+  await f.tick();
+  await f.send(followup("old-followup", "obsolete queued work"));
+  move(f, "", "review"); await f.send(statusEvent("review-move")); await f.tick(12);
+  await f.send(followup("stale-answer", 'answer old-question {"audience":"everyone"}'));
+  await f.send(followup("holding-resume", "resume")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  assert.equal(f.commands.filter(c => c.type === "thread.user-input.respond").length, 0);
+  move(f, "to-spec"); await f.send(statusEvent("return-from-review")); await f.tick(12);
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
+  assert.equal(f.threads.size, 1);
+  f.issueOverrides["issue-1"].delegate = null;
+  await f.send({ ...statusEvent("removed-delegation"), updatedFrom: { delegateId: "app" } }); await f.tick(12);
+  await f.send(followup("withdrawn-resume", "resume")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
+  assert.equal(await readFile(path.join(f.repo, ".git", "HEAD"), "utf8"), `ref: refs/heads/${thread.branch}\n`);
+});
+
+test("ordinary board movement cannot create sessions and stale issue events do not rerun a stage", async t => {
+  const f = await fixture(t);
+  await f.send(statusEvent("unrelated")); await f.tick();
+  assert.equal(f.commands.length, 0);
+  move(f, "grill-me"); await f.send(delegation()); await f.tick();
+  planningResult(f, {}); await f.tick();
+  await f.send(statusEvent("stale-event")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+});
+
+test("publication conflict accepts revision feedback with refreshed context", async t => {
+  const f = await fixture(t);
+  move(f, "to-spec"); await f.send(delegation()); await f.tick();
+  planningResult(f, { specification: { previousDescription: "Use https://example.org/design", description: "Draft from stale context" } });
+  await f.tick(1);
+  f.issueOverrides["issue-1"].description = "Human corrected requirements";
+  await f.tick();
+  await f.send(followup("revise-conflict", "Revise using my corrected requirements")); await f.tick();
+  const turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 2);
+  assert.match(turns[1].message.text, /Human corrected requirements/);
+  assert.equal(f.issueOverrides["issue-1"].description, "Human corrected requirements");
+});
+
+test("ticket revision adopts an existing dependency identity before later removal", async t => {
+  const f = await fixture(t);
+  move(f, "to-tickets"); await f.send(delegation()); await f.tick();
+  const children = ["first", "second"].map(key => ({ key, title: key, description: key, acceptanceCriteria: ["works"], blockedBy: [] as string[] }));
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  const writes = f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate"));
+  const first = writes.find(w => w.variables.input.title === "first").variables.input.id;
+  const second = writes.find(w => w.variables.input.title === "second").variables.input.id;
+  f.relations.push({ id: "human-edge", type: "blocks", issueId: first, relatedIssueId: second });
+  await f.send(followup("adopt-edge", "Keep the dependency I added")); await f.tick();
+  children[1]!.blockedBy = ["first"];
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  assert.equal(f.relations.length, 1);
+  await f.send(followup("remove-edge", "Remove the dependency")); await f.tick();
+  children[1]!.blockedBy = [];
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  assert.equal(f.relations.length, 0);
+});
+
+test("grilling questions and answers are retained as parent comments", async t => {
+  const f = await fixture(t);
+  move(f, "grill-me"); await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "qa-activity", kind: "user-input.requested", summary: "Audience?", tone: "info", turnId: thread.latestTurn.turnId, payload: { requestId: "qa-request", questions: [{ id: "audience", question: "Who is the audience?" }] } });
+  await f.tick();
+  await f.send(followup("qa-answer", 'answer qa-request {"audience":"Operators"}')); await f.tick();
+  assert.ok(f.comments.some(c => /Who is the audience/.test(c.body)));
+  assert.ok(f.comments.some(c => /Operators/.test(c.body)));
+  await f.restart(); await f.tick();
+  assert.equal(f.comments.filter(c => /Who is the audience/.test(c.body)).length, 1);
+});
+
+test("delegated implementation child gets fresh parent specification and decisions", async t => {
+  const f = await fixture(t);
+  f.issueOverrides["issue-1"] = { parent: { id: "parent" }, title: "Implement child scope", description: "Acceptance: child works" };
+  f.issueOverrides.parent = { title: "Parent feature", description: "Authoritative parent specification", comments: { nodes: [{ id: "decision", body: "Agreed decision: operators only", createdAt: "2026-09-15T00:00:00Z", user: { name: "Human" } }], pageInfo: { hasNextPage: false } } };
+  await f.send(delegation()); await f.tick();
+  const turn = f.commands.find(c => c.type === "thread.turn.start");
+  assert.ok(turn);
+  assert.match(turn.message.text, /Authoritative parent specification/);
+  assert.match(turn.message.text, /Agreed decision: operators only/);
+  assert.match(turn.message.text, /Acceptance: child works/);
+  assert.equal(f.threads.size, 1);
+});
+
+test("missing parent specification prevents child implementation", async t => {
+  const f = await fixture(t);
+  f.issueOverrides["issue-1"] = { parent: { id: "parent" } };
+  f.issueOverrides.parent = { description: null };
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 0);
+  assert.ok(f.activities.some(a => a.content.type === "error" && /parent specification/.test(a.content.body)));
 });
