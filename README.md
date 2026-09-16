@@ -68,19 +68,18 @@ Run the bridge on the **same host as T3Code**, under the account with access to 
 
 4. Add the YAML from [Project configuration](#project-configuration) as a code block in the Linear project's **detailed description**. Set `project` to the exact active T3Code project title, including case and spaces. Use the actual Linear team key and status names. When setup asks, supply an existing issue identifier from that project to check routing. Setup neither delegates it nor starts work. Model and workspace preferences come from T3Code; no UUIDs are needed.
 
-5. Start the bridge in another terminal:
+5. Setup checks that the bridge and public HTTPS endpoint are reachable. If prompted, start the bridge in another terminal and press Enter in setup:
 
    ```sh
+   npm run build
    npm start
    ```
 
-   Complete the [existing app-actor OAuth installation](docs/operations.md#install-the-linear-app). Setup's first diagnostic run will report the missing installation until you do this. Then run:
+   Setup opens Linear in your browser. Choose the intended workspace and approve the app. **The credentials identify your app; this one-time approval authorizes it to access the workspace.** Setup handles the installation secret internally—there is no extra secret to find or paste. It detects the saved installation automatically and runs diagnostics.
 
-   ```sh
-   npm run setup
-   ```
+   If a browser cannot open, setup prints a direct Linear authorization link. Use `npm run setup -- --no-browser` to request that link explicitly. If the link expires or the browser reports an error, correct the problem and press Enter in setup to retry. Ctrl+C safely stops setup; rerunning preserves saved answers and completed installation.
 
-   Reruns preserve saved settings and credentials. A completed run says **configuration and available connection checks passed**. Actual Linear webhook receipt, write permissions and end-to-end execution remain **unverified**. No coding task or draft PR is required to finish onboarding.
+   A completed run says **configuration and available connection checks passed**. Actual Linear webhook receipt, write permissions and end-to-end execution remain **unverified**. No coding task or draft PR is required to finish onboarding.
 
 Use `npm run doctor` anytime for read-only diagnostics, or `npm run doctor -- --issue NOR-123` to inspect another project's association. Each check reports PASS, FAIL or UNVERIFIED and a repair step. Exit code 1 means setup is incomplete; 0 means available checks passed, with the displayed unverified checks still outstanding. Corrections use `npm run setup -- --replace KEY`; restart the bridge afterwards. If interrupted, just rerun setup. Keep `.env` private and never delete session or installation files to reconnect.
 

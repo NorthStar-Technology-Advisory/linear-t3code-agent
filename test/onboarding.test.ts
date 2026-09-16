@@ -11,13 +11,13 @@ import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { parse } from "dotenv";
 const command = path.resolve("src/onboarding.ts");
-async function run(cwd: string, args: string[], input = "", env: NodeJS.ProcessEnv = {}) {
+async function run(cwd: string, args: string[], input = "", env: NodeJS.ProcessEnv = {}, keepInputOpen = false) {
   const child = spawn(process.execPath, ["--import", path.resolve("node_modules/tsx/dist/loader.mjs"), command, ...args], {
     cwd, env: { PATH: process.env.PATH, HOME: cwd, ...env }, stdio: ["pipe", "pipe", "pipe"],
   });
   let output = "";
   child.stdout.on("data", data => { output += data; }); child.stderr.on("data", data => { output += data; });
-  child.stdin.end(input);
+  if (keepInputOpen) child.stdin.write(input); else child.stdin.end(input);
   const code = await new Promise<number | null>(resolve => child.on("close", resolve));
   return { code, output };
 }
@@ -71,7 +71,7 @@ async function fixture(t: TestContext) {
   await mkdir(path.join(cwd, "bin"));
   await writeFile(path.join(cwd, "bin/gh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   const observed: string[] = [];
-  const state = { t3Status: 200, linearStatus: 200, duplicate: false, unmatched: false, inaccessible: false, incompatible: false, settingsInvalid: false };
+  const state = { t3Status: 200, linearStatus: 200, duplicate: false, unmatched: false, inaccessible: false, incompatible: false, settingsInvalid: false, publicDown: false, installDenied: false, staleCallback: false, unsafeRedirect: false };
   const project = { id: "t3-project", title: "Example project", workspaceRoot: cwd, deletedAt: null, defaultModelSelection: null };
   const service = createServer(async (req, res) => {
     let body = ""; for await (const chunk of req) body += chunk;
@@ -79,6 +79,15 @@ async function fixture(t: TestContext) {
     res.setHeader("content-type", "application/json");
     const send = (value: unknown) => res.end(JSON.stringify(value));
     if (req.url === "/healthz") return send({ ok: true, service: "linear-t3code-agent" });
+    if (req.url === "/public-health") { res.statusCode = state.publicDown ? 503 : 200; return send({ ok: !state.publicDown, service: "linear-t3code-agent" }); }
+    if (req.url === "/linear/install") {
+      assert.equal(req.headers.authorization, "Bearer private-install-secret");
+      const url = new URL("https://linear.app/oauth/authorize");
+      for (const [key, value] of Object.entries({ client_id: "client", redirect_uri: state.staleCallback ? "https://old.example/linear/oauth/callback" : "https://bridge.example/linear/oauth/callback", actor: "app", response_type: "code", state: "test-csrf-state" })) url.searchParams.set(key, value);
+      res.statusCode = state.installDenied ? 401 : 302;
+      if (!state.installDenied) res.setHeader("location", state.unsafeRedirect ? "https://untrusted.example/authorize" : url.href);
+      return res.end();
+    }
     if (req.url === "/graphql") {
       res.statusCode = state.linearStatus;
       const query = JSON.parse(body).query; observed.push(query);
@@ -107,7 +116,7 @@ async function fixture(t: TestContext) {
   const address = service.address(); if (!address || typeof address === "string") throw new Error("address");
   const origin = `http://127.0.0.1:${address.port}`;
   // Redirect only the two fixed external services; leave real HTTP/RPC transports intact.
-  await writeFile(path.join(cwd, "network.mjs"), `const original=globalThis.fetch;globalThis.fetch=(url,options)=>{const text=String(url);return original(text==='https://api.linear.app/graphql'?'${origin}/graphql':text==='https://bridge.example/healthz'?'${origin}/healthz':url,options)};`);
+  await writeFile(path.join(cwd, "network.mjs"), `const original=globalThis.fetch;globalThis.fetch=(url,options)=>{const text=String(url);return original(text==='https://api.linear.app/graphql'?'${origin}/graphql':text==='https://bridge.example/healthz'?'${origin}/public-health':url,options)};`);
   const env = { PATH: `${cwd}/bin:${process.env.PATH}`, NODE_OPTIONS: `--import=${cwd}/network.mjs` };
   const values = { BASE_URL: "https://bridge.example", LINEAR_REDIRECT_URI: "https://bridge.example/linear/oauth/callback", INSTALL_SECRET: "private-install-secret", LINEAR_CLIENT_ID: "client", LINEAR_CLIENT_SECRET: "client-secret", LINEAR_WEBHOOK_SECRET: "webhook-secret", T3CODE_URL: origin, T3CODE_TOKEN: "private-token", TOKEN_STORE_PATH: "tokens.json", PORT: String(address.port), SETUP_ISSUE: "NOR-1", CUSTOM: "preserved" };
   await writeFile(path.join(cwd, ".env"), Object.entries(values).map(([key, value]) => `${key}=${value}\n`).join(""));
@@ -208,4 +217,107 @@ test("Linear timeout reports connectivity repair, not reinstall", async t => {
   const result = await run(f.cwd, ["doctor"], "", { ...f.env, NODE_OPTIONS: `${f.env.NODE_OPTIONS} --import=${f.cwd}/timeout.mjs` });
   assert.equal(result.code, 1);
   assert.match(result.output, /FAIL Linear installation: Connection failed/);
+});
+
+async function browserStub(cwd: string, install: boolean, fail = false) {
+  const code = `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+writeFileSync('browser-url', process.argv[2]);
+${fail ? 'process.exit(1);' : ''}
+${install ? `writeFileSync('tokens.json', JSON.stringify({ default_app_user_id: 'app', installations: { app: { access_token: 'new-private-linear-token', expires_at: Date.now()+3600000, scope: 'read,write,app:assignable,app:mentionable' } } }));` : ''}
+`;
+  // No actual user browser is opened by these subprocess tests.
+  for (const name of ['open', 'xdg-open']) await writeFile(path.join(cwd, 'bin', name), code, { mode: 0o700 });
+}
+
+test("setup opens Linear without installation secrets in browser URLs and detects saved approval", async t => {
+  const f = await fixture(t);
+  await rm(path.join(f.cwd, "tokens.json"));
+  await browserStub(f.cwd, true);
+  const result = await run(f.cwd, ["setup"], "", f.env);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /Opened Linear in your browser/);
+  assert.match(result.output, /Linear installation saved/);
+  assert.match(result.output, /PASS Linear installation/);
+  assert.doesNotMatch(result.output, /private-install-secret|new-private-linear-token|client-secret|webhook-secret/);
+  const url = new URL(await readFile(path.join(f.cwd, "browser-url"), "utf8"));
+  assert.equal(url.origin, "https://linear.app");
+  assert.equal(url.searchParams.get("actor"), "app");
+  assert.equal(url.searchParams.get("redirect_uri"), "https://bridge.example/linear/oauth/callback");
+  assert.equal(url.searchParams.has("install_secret"), false);
+  assert.equal(await readFile(path.join(f.cwd, "session-state"), "utf8"), "preserve sessions");
+  await rm(path.join(f.cwd, "browser-url"));
+  const repeat = await run(f.cwd, ["setup"], "", f.env);
+  assert.equal(repeat.code, 0, repeat.output);
+  await assert.rejects(readFile(path.join(f.cwd, "browser-url")), /ENOENT/);
+});
+
+test("browser failure and no-browser mode provide a manual Linear link without installation secrets", async t => {
+  for (const noBrowser of [false, true]) await t.test(String(noBrowser), async t => {
+    const f = await fixture(t);
+    await rm(path.join(f.cwd, "tokens.json"));
+    await browserStub(f.cwd, false, true);
+    const result = await run(f.cwd, noBrowser ? ["setup", "--no-browser"] : ["setup"], "", f.env);
+    assert.equal(result.code, 1);
+    assert.match(result.output, /https:\/\/linear.app\/oauth\/authorize\?/);
+    assert.match(result.output, /Input closed before installation completed/);
+    assert.doesNotMatch(result.output, /private-install-secret|client-secret|webhook-secret/);
+    if (noBrowser) await assert.rejects(readFile(path.join(f.cwd, "browser-url")), /ENOENT/);
+  });
+});
+
+test("setup waits for a working public endpoint and rejects denied, stale or unsafe installation redirects", async t => {
+  for (const scenario of ["publicDown", "installDenied", "staleCallback", "unsafeRedirect"] as const) await t.test(scenario, async t => {
+    const f = await fixture(t);
+    await rm(path.join(f.cwd, "tokens.json"));
+    await browserStub(f.cwd, true);
+    f.state[scenario] = true;
+    const result = await run(f.cwd, ["setup"], "", f.env);
+    assert.equal(result.code, 1);
+    assert.match(result.output, scenario === "publicDown" ? /public HTTPS address is not reaching/ : /Restart it from this checkout/);
+    await assert.rejects(readFile(path.join(f.cwd, "browser-url")), /ENOENT/);
+    assert.doesNotMatch(result.output, /private-install-secret|untrusted.example/);
+  });
+});
+
+test("explicit Linear reconnect preserves existing installation until new approval", async t => {
+  const f = await fixture(t);
+  await browserStub(f.cwd, false);
+  const before = await readFile(path.join(f.cwd, "tokens.json"), "utf8");
+  const result = await run(f.cwd, ["setup", "--reconnect-linear", "--no-browser"], "", f.env);
+  assert.equal(result.code, 1);
+  assert.match(result.output, /Open this Linear authorization link manually/);
+  assert.doesNotMatch(result.output, /Linear installation saved/);
+  assert.equal(await readFile(path.join(f.cwd, "tokens.json"), "utf8"), before);
+});
+
+test("setup detects an asynchronous OAuth callback without needing an Enter key", async t => {
+  const f = await fixture(t);
+  await rm(path.join(f.cwd, "tokens.json"));
+  const callback = `import {writeFileSync} from 'node:fs'; setTimeout(()=>writeFileSync('tokens.json', JSON.stringify({default_app_user_id:'app',installations:{app:{access_token:'asynchronous-token',expires_at:Date.now()+3600000,scope:'read,write,app:assignable,app:mentionable'}}})), 100);`;
+  for (const name of ["open", "xdg-open"]) await writeFile(path.join(f.cwd, "bin", name), `#!${process.execPath}\nimport {spawn} from 'node:child_process'; spawn(process.execPath,['--input-type=module','-e',${JSON.stringify(callback)}],{detached:true,stdio:'ignore'}).unref();\n`, { mode: 0o700 });
+  const result = await run(f.cwd, ["setup"], "", f.env, true);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /Waiting for Linear installation/);
+  assert.match(result.output, /Linear installation saved/);
+  assert.match(result.output, /PASS Linear installation/);
+});
+
+test("Enter retries authorization with a fresh install request and preserves session data", async t => {
+  const f = await fixture(t);
+  await rm(path.join(f.cwd, "tokens.json"));
+  const result = await run(f.cwd, ["setup", "--no-browser"], "\n", f.env);
+  assert.equal(result.code, 1);
+  assert.equal(f.observed.filter(value => value === "GET /linear/install").length, 2);
+  assert.equal(await readFile(path.join(f.cwd, "session-state"), "utf8"), "preserve sessions");
+});
+
+test("a stopped bridge prompts for startup without launching browser authorization", async t => {
+  const f = await fixture(t);
+  await rm(path.join(f.cwd, "tokens.json"));
+  const result = await run(f.cwd, ["setup"], "", { ...f.env, PORT: "1" });
+  assert.equal(result.code, 1);
+  assert.match(result.output, /In another terminal in this checkout/);
+  assert.match(result.output, /Setup paused/);
+  assert.ok(!f.observed.includes("GET /linear/install"));
 });
