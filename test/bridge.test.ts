@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import type { PullRequest } from "../src/pull-requests.js";
 import { createHmac } from "node:crypto";
-import { mkdtemp, rm, writeFile, readFile, mkdir, symlink, rename } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir, realpath, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createServer, type Server } from "node:http";
@@ -31,7 +31,7 @@ async function close(server: Server) {
 }
 
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(path.join(tmpdir(), "nor173-"));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "nor173-")));
   const repo = path.join(root, "repo");
   await mkdir(repo);
   execFileSync("git", ["init", "-b", "main", repo]);
@@ -114,7 +114,7 @@ async function fixture(t: TestContext) {
       } else if (query.includes("BridgeTeamStatuses")) {
         res.end(JSON.stringify({ data: { team: { states: { nodes: statusNodes, pageInfo: { hasNextPage: false } } } } }));      } else {
         reads.push(variables);
-        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
+        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: variables.id === "issue-1" ? "NOR-1" : `NOR-${variables.id}`, title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
       }
     } else {
       assert.equal(req.headers.authorization, "Bearer t3-secret");
@@ -381,7 +381,7 @@ test("draft PR results include validation; closed PRs reject follow-ups and pres
   f.pr.state = "MERGED";
   await f.send(followup("after-merge", "more implementation")); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  assert.ok(f.activities.some(a => /new delegation/i.test(a.content.body)));
+  assert.ok(f.activities.some(a => /new Linear ticket/i.test(a.content.body)));
   assert.ok(f.activities.some(a => /preserved.*uncommitted/i.test(a.content.body)));
 });
 
@@ -738,41 +738,16 @@ test("null project model inherits T3Code environment settings", async t => {
   assert.deepEqual(f.commands.find(c => c.type === "thread.turn.start")?.modelSelection, { instanceId: "codex", model: "inherited-model" });
 });
 
-test("current checkout branches from HEAD and preserves existing files without a worktree", async t => {
+test("tickets use readable isolated branches even when T3Code prefers the current checkout", async t => {
   const f = await fixture(t); f.projects[0].defaultThreadEnvMode = "local";
-  execFileSync("git", ["-C", f.repo, "checkout", "-b", "in-progress"]);
-  execFileSync("git", ["-C", f.repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "Current HEAD"]);
-  const head = execFileSync("git", ["-C", f.repo, "rev-parse", "HEAD"], { encoding: "utf8" });
+  f.issueOverrides["issue-1"] = { identifier: "NOR-228", title: "Test issue to test T3Code connectivity" };
   await writeFile(path.join(f.repo, "keep.txt"), "existing files");
   await f.send(delegation()); await f.tick();
   const thread = [...f.threads.values()][0];
-  assert.equal(thread.worktreePath, null);
-  assert.equal(execFileSync("git", ["-C", f.repo, "branch", "--show-current"], { encoding: "utf8" }).trim(), thread.branch);
-  assert.equal(execFileSync("git", ["-C", f.repo, "rev-parse", "HEAD"], { encoding: "utf8" }), head);
-  assert.equal((execFileSync("git", ["-C", f.repo, "worktree", "list", "--porcelain"], { encoding: "utf8" }).match(/^worktree /gm) ?? []).length, 1);
+  assert.equal(thread.branch, "t3code/nor-228-test-issue-to-test-t3code-connectivity");
+  assert.ok(thread.worktreePath); assert.notEqual(thread.worktreePath, f.repo);
+  assert.equal(execFileSync("git", ["-C", f.repo, "branch", "--show-current"], { encoding: "utf8" }).trim(), "main");
   assert.equal(await readFile(path.join(f.repo, "keep.txt"), "utf8"), "existing files");
-});
-
-test("checkout cancellation waits for provider stop, ends before a PR exists, and requires an explicit competing resume", async t => {
-  const f = await fixture(t); f.projects[0].defaultThreadEnvMode = "local"; f.options.concurrency = 2;
-  f.options.pullRequests.find = async () => null;
-  await writeFile(path.join(f.repo, "keep.txt"), "preserve");
-  await f.send(delegation()); await f.tick(); await f.send(delegation("competitor")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  assert.ok(f.activities.some(a => a.agentSessionId === "competitor" && /reserved by Linear session session-1/.test(a.content.body)));
-  await f.restart(); f.faults.deferStop = true;
-  await f.send(followup("cancel", "cancel")); await f.tick();
-  await f.send(followup("early", "resume", "competitor")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  const thread = [...f.threads.values()][0];
-  thread.session = { status: "stopped", activeTurnId: null, lastError: null }; thread.latestTurn.state = "interrupted";
-  await f.tick(); await f.restart(); await f.tick();
-  await f.send(followup("terminal", "resume")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  assert.ok(f.activities.some(a => /session has ended/.test(a.content.body)));
-  await f.send(followup("retry", "resume", "competitor")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
-  assert.equal(await readFile(path.join(f.repo, "keep.txt"), "utf8"), "preserve");
 });
 
 test("new worktree uses T3Code bootstrap from repository default and inherits start-from-origin", async t => {
@@ -823,34 +798,16 @@ test("unavailable effective settings pause and can be corrected before the first
   });
 });
 
-test("workspace settings follow project, repository JSONC, then environment precedence", async t => {
+test("ticket isolation overrides local preferences at every settings level", async t => {
   for (const scenario of ["project", "repository", "environment"]) await t.test(scenario, async t => {
     const f = await fixture(t);
     f.projects[0].defaultThreadEnvMode = scenario === "project" ? "local" : null;
     f.settings.defaultThreadEnvMode = scenario === "environment" ? "local" : "worktree";
     if (scenario !== "environment") await writeFile(path.join(f.repo, "t3.json"), '{ // repository preference\n "defaultThreadEnvMode": "' + (scenario === "project" ? "worktree" : "local") + '",\n}');
     await f.send(delegation()); await f.tick();
-    assert.equal([...f.threads.values()][0]?.worktreePath, null);
-    assert.equal(f.commands.find(c => c.type === "thread.turn.start")?.bootstrap, undefined);
+    assert.ok([...f.threads.values()][0]?.worktreePath);
+    assert.ok(f.commands.find(c => c.type === "thread.turn.start")?.bootstrap?.prepareWorktree);
   });
-});
-
-test("checkout reservation persists through idle feedback and restart, releasing after PR closure stops the provider", async t => {
-  const f = await fixture(t); f.projects[0].defaultThreadEnvMode = "local"; f.options.concurrency = 2;
-  await f.send(delegation()); await f.tick(); finish(f); await f.tick(); await f.restart();
-  await f.send(delegation("waiting")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  await f.send(followup("feedback", "Please adjust the implementation")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
-  f.faults.deferStop = true; f.pr.state = "MERGED"; await f.tick();
-  await f.send(followup("too-soon", "resume", "waiting")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
-  const thread = [...f.threads.values()][0]; thread.session = { status: "stopped", activeTurnId: null, lastError: null }; thread.latestTurn.state = "interrupted";
-  await f.tick(); f.pr.state = "OPEN"; await f.restart(); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
-  await f.send(followup("released", "resume", "waiting")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 3);
-  assert.equal((execFileSync("git", ["-C", f.repo, "worktree", "list", "--porcelain"], { encoding: "utf8" }).match(/^worktree /gm) ?? []).length, 1);
 });
 
 test("established sessions retain settings and identity while new sessions resolve renamed projects", async t => {
@@ -884,7 +841,7 @@ test("folded project settings override stale snapshot values and a cleared effec
   await f.send(followup("corrected", "resume")); await f.tick();
   const turn = f.commands.find(c => c.type === "thread.turn.start");
   assert.deepEqual(turn.modelSelection, { instanceId: "codex", model: "inherited-model", options: { effort: "high" } });
-  assert.equal([...f.threads.values()][0].worktreePath, null);
+  assert.ok([...f.threads.values()][0].worktreePath);
 });
 
 test("disabled project provider settings inherit the enabled environment provider", async t => {
@@ -896,16 +853,13 @@ test("disabled project provider settings inherit the enabled environment provide
   assert.equal(f.commands.find(c => c.type === "thread.turn.start")?.modelSelection.instanceId, "codex");
 });
 
-test("simultaneous checkout claims cannot both execute, including aliases of a reserved path", async t => {
+test("different tickets can execute concurrently in separate worktrees", async t => {
   const f = await fixture(t); f.projects[0].defaultThreadEnvMode = "local"; f.options.concurrency = 2;
   await Promise.all([f.send(delegation("one")), f.send(delegation("two"))]); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  assert.ok(f.activities.some(a => /reserved by Linear session/.test(a.content.body)));
-  const alias = path.join(f.root, "alias"); await symlink(f.repo, alias);
-  f.projects[0].workspaceRoot = alias;
-  await f.send(delegation("alias")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
-  assert.ok(f.activities.some(a => a.agentSessionId === "alias" && /reserved/.test(a.content.body)));
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
+  const threads = [...f.threads.values()];
+  assert.notEqual(threads[0].branch, threads[1].branch);
+  assert.notEqual(threads[0].worktreePath, threads[1].worktreePath);
 });
 
 test("worktree without a known default starts at the checked-out branch and can keep local history", async t => {
@@ -919,16 +873,12 @@ test("worktree without a known default starts at the checked-out branch and can 
   assert.equal(execFileSync("git", ["-C", [...f.threads.values()][0].worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }), head);
 });
 
-test("a checkout reservation survives a failed branch switch and can be cancelled before thread creation", async t => {
-  const f = await fixture(t); f.projects[0].defaultThreadEnvMode = "local"; f.options.concurrency = 2;
-  await writeFile(path.join(f.repo, ".git", "index.lock"), "busy");
+test("existing unowned ticket branches pause without creating a thread or replacing files", async t => {
+  const f = await fixture(t);
+  execFileSync("git", ["-C", f.repo, "branch", "t3code/nor-1-make-a-change"]);
   await f.send(delegation()); await f.tick();
-  assert.equal(f.commands.length, 0); assert.ok(f.activities.some(a => /Files preserved.*resume/.test(a.content.body)));
-  await f.send(delegation("other")); await f.tick(); assert.equal(f.commands.length, 0);
-  await f.send(followup("cancel", "cancel")); await f.tick();
-  await rm(path.join(f.repo, ".git", "index.lock")); await f.restart(); await f.tick(); assert.equal(f.commands.length, 0);
-  await f.send(followup("resume", "resume", "other")); await f.tick();
-  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  assert.equal(f.commands.length, 0);
+  assert.ok(f.activities.some(a => /already exists without a saved ticket workspace/.test(a.content.body)));
 });
 
 test("uncertain bootstrap setup pauses after preparation until explicit repair and resume", async t => {
@@ -1105,7 +1055,7 @@ test("moving to review or removing delegation retires unanswered questions and b
   await f.send({ ...statusEvent("removed-delegation"), updatedFrom: { delegateId: "app" } }); await f.tick(12);
   await f.send(followup("withdrawn-resume", "resume")); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
-  assert.equal(await readFile(path.join(f.repo, ".git", "HEAD"), "utf8"), `ref: refs/heads/${thread.branch}\n`);
+  assert.equal(await readFile(path.join(f.repo, ".git", "HEAD"), "utf8"), "ref: refs/heads/main\n");
 });
 
 test("ordinary board movement cannot create sessions and stale issue events do not rerun a stage", async t => {
@@ -1241,6 +1191,8 @@ test("replacement delegation waits for superseded provider stop even with spare 
   f.options.concurrency = 2;
   move(f, "grill-me"); await f.send(delegation()); await f.tick();
   const oldThread = [...f.threads.values()][0];
+  await writeFile(path.join(oldThread.worktreePath, "ticket-work.txt"), "preserved changes");
+  f.issueOverrides["issue-1"].title = "Renamed while working";
   f.faults.deferStop = true;
   const replacement = { ...delegation("replacement"), agentSession: { id: "replacement", issue: { id: "issue-1" } } };
   await f.send(replacement); await f.tick(); await f.restart();
@@ -1253,6 +1205,11 @@ test("replacement delegation waits for superseded provider stop even with spare 
   const turns = f.commands.filter(c => c.type === "thread.turn.start");
   assert.equal(turns.length, 2);
   assert.notEqual(turns[1].threadId, oldThread.id);
+  const replacementThread = f.threads.get(turns[1].threadId);
+  assert.equal(replacementThread.branch, oldThread.branch);
+  assert.equal(replacementThread.worktreePath, oldThread.worktreePath);
+  assert.equal(turns[1].bootstrap, undefined);
+  assert.equal(await readFile(path.join(replacementThread.worktreePath, "ticket-work.txt"), "utf8"), "preserved changes");
 });
 
 
@@ -1407,4 +1364,25 @@ test("unknown configured status pauses even if a different status is selected", 
   await f.restart(); await f.tick(); assert.equal(f.commands.length, 0);
   await f.send(followup("fixed-status", "resume")); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+});
+
+test("replacement delegation cannot reopen a retired ticket workspace", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick(); finish(f); await f.tick();
+  f.pr.state = "MERGED"; await f.tick(); await f.restart();
+  await f.send({ ...delegation("replacement"), agentSession: { id: "replacement", issue: { id: "issue-1" } } });
+  await f.tick(12);
+  assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
+  assert.ok(f.activities.some(a => a.agentSessionId === "replacement" && /workspace is retired/.test(a.content.body)));
+});
+
+test("replacement with a missing ticket worktree pauses without allocating another", async t => {
+  const f = await fixture(t);
+  move(f, "grill-me"); await f.send(delegation()); await f.tick();
+  const original = [...f.threads.values()][0];
+  await rename(original.worktreePath, original.worktreePath + "-moved");
+  await f.send({ ...delegation("replacement"), agentSession: { id: "replacement", issue: { id: "issue-1" } } });
+  await f.tick(12); await f.restart(); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
+  assert.ok(f.activities.some(a => a.agentSessionId === "replacement" && /ticket worktree is missing/.test(a.content.body)));
 });

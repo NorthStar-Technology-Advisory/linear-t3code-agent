@@ -11,3 +11,11 @@ export async function prepareCheckout(route: Route, branch: string): Promise<voi
   if (await git(route.repository, "branch", "--show-current") === branch) return;
   await git(route.repository, "switch", "-c", branch, "HEAD");
 }
+
+export function ticketBranch(identifier: string, title: string): string {
+  const slug = (text: string) => text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const key = slug(identifier);
+  if (!key) throw new Error("Linear issue identifier is missing; cannot allocate a ticket branch.");
+  const summary = slug(title).slice(0, 100).replace(/-+$/, "");
+  return `t3code/${key}${summary ? `-${summary}` : ""}`;
+}

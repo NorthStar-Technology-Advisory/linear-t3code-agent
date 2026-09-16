@@ -78,18 +78,18 @@ export async function doctor(values: NodeJS.ProcessEnv, args: string[]): Promise
   else {
     try {
       const data = await query<{ issue: { project: { id: string } | null } | null }>("query DoctorIssue($id: String!) { issue(id: $id) { project { id } } }", { id: issue });
-      selected = matchProject(projects, await projectTitle(query, data.issue?.project?.id));
-      report("PASS", "project association", "Project YAML is valid, team/status names resolve, and exactly one active T3Code project matches.");
+      selected = await matchProject(projects, await projectTitle(query, data.issue?.project?.id));
+      report("PASS", "project association", "Project YAML is valid, team/status names resolve, and an active T3Code source checkout resolves.");
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      const reason = /Multiple T3Code/.test(message) ? "Multiple active T3Code projects match; give them unique titles." : /No active T3Code/.test(message) ? "No active T3Code project matches; correct the exact title, including case and spaces." : "Check the t3code YAML block in the project detailed description, team keys, status names and project access.";
+      const reason = /Multiple T3Code/.test(message) ? "Matching T3Code checkouts could not be verified as one repository; repair Git metadata or give unrelated projects unique titles." : /No active T3Code/.test(message) ? "No active T3Code project matches; correct the exact title, including case and spaces." : "Check the t3code YAML block in the project detailed description, team keys, status names and project access.";
       report("FAIL", "project association", reason);
     }
   }
   if (selected && runner) {
     await check("effective settings", "Configure an available model/provider and workspace preference in T3Code; check settings/provider read scopes and repository t3.json.", async () => {
       const settings = await runner!.execution(selected!);
-      return `Inherited provider/model available; workspace mode ${settings.workspaceMode}; start from origin ${settings.startFromOrigin}.`;
+      return `Inherited provider/model available; isolated ticket worktree (T3Code preference ${settings.workspaceMode}); start from origin ${settings.startFromOrigin}.`;
     });
     await check("repository access", "Run on the same host/account or mount identical absolute paths; restore read/write access to the repository and Git metadata.", async () => {
       await access(selected!.workspaceRoot, constants.R_OK | constants.W_OK | constants.X_OK);

@@ -102,7 +102,7 @@ async function fixture(t: TestContext) {
     if (req.url === "/api/orchestration/snapshot") {
       res.statusCode = state.t3Status;
       if (state.incompatible) return send({ bad: "contract" });
-      return send({ projects: [{ ...project, workspaceRoot: state.inaccessible ? path.join(cwd, "missing") : cwd }, ...(state.duplicate ? [{ ...project, id: "duplicate" }] : [])] });
+      return send({ projects: [{ ...project, workspaceRoot: state.inaccessible ? path.join(cwd, "missing") : cwd }, ...(state.duplicate ? [{ ...project, id: "duplicate", workspaceRoot: path.join(cwd, "unverified-checkout") }] : [])] });
     }
     if (req.url === "/api/auth/websocket-ticket") return send({ ticket: "temporary-ticket" });
     res.statusCode = 500; send({ error: "Unexpected work-producing request" });
@@ -152,7 +152,7 @@ test("doctor explains auth, contract, association and repository failures indepe
     ["t3Status", 401, /FAIL T3Code: Authentication rejected/],
     ["linearStatus", 403, /FAIL Linear installation: Authentication rejected/],
     ["incompatible", true, /FAIL T3Code: API incompatible/],
-    ["duplicate", true, /FAIL project association: Multiple/],
+    ["duplicate", true, /FAIL project association: Matching/],
     ["unmatched", true, /FAIL project association: No active/],
     ["inaccessible", true, /FAIL repository access/],
     ["settingsInvalid", true, /FAIL effective settings/],
