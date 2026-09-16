@@ -37,109 +37,54 @@ When moving from linear-pi-agent, configure the T3Code connection and project la
 - A public HTTPS address, through a reverse proxy or tunnel, forwarding to the bridge's localhost listener.
 - The bridge and T3Code must see the same repository, worktree and context files at the same absolute paths. Running them on the same host is the simplest arrangement. A remote T3Code host needs shared files at identical paths; the bridge does not transfer checkouts.
 
-The core live acceptance exercise passed against a Mac Mini T3Code environment: draft-PR delivery, same-session follow-up, restart recovery and cancellation with preserved edits. See [the acceptance record](docs/acceptance/nor-173.md) for evidence, tested configuration, an observed orphaned-child-process limitation during cancellation, and remaining live coverage limits. Verify your own deployment using the checklist below.
+## Quickstart: existing Linear and T3Code installations
 
-## Setup
+Run the bridge on the **same host as T3Code**, under the account with access to your repositories and credentials. Both processes must see files at identical absolute paths. Setup does not provision infrastructure.
 
-The steps below cover a fresh installation. [INSTALL.md](INSTALL.md) also provides a compact deployment checklist suitable for a coding agent.
+1. Clone and build the bridge separately from the repositories you want it to work on:
 
-### 1. Prepare the bridge and T3Code
+   ```sh
+   git clone https://github.com/NorthStar-Technology-Advisory/linear-t3code-agent.git
+   cd linear-t3code-agent
+   npm ci
+   npm run build
+   ```
 
-Clone this fork separately from your target repositories, then run:
+2. Keep T3Code running. Register your target repository as a project with a unique title and a working model/provider. On that host, obtain a credential:
 
-```sh
-git clone https://github.com/NorthStar-Technology-Advisory/linear-t3code-agent.git
-cd linear-t3code-agent
-npm ci
-cp .env.example .env
-chmod 600 .env
-```
+   ```sh
+   t3 auth session issue --label bridge --ttl 30d --token-only
+   ```
 
-In T3Code, register each target repository as a project with a unique, recognizable title. Configure its model and workspace preferences there, or let them inherit environment defaults. Obtain a bearer credential permitting orchestration reads/commands, settings and provider reads, and VCS branch/status reads using T3Code's current [environment authentication flow](https://github.com/pingdotgg/t3code/blob/main/docs/internals/environment-auth.md).
+   Paste the result only into setup's hidden credential prompt. Use the same T3Code data directory as the running instance (`--base-dir` if customized). This credential expires after 30 days; see [credential renewal](docs/operations.md#credentials-and-reconnection). The command grants administrative scopes in the verified T3Code version.
 
-Set these values in `.env`:
+3. Arrange a stable public HTTPS address forwarding to `http://127.0.0.1:8787`. Follow the [persistent tunnel or reverse-proxy instructions](docs/operations.md#public-https). Then run:
 
-```dotenv
-T3CODE_URL=http://127.0.0.1:3773
-T3CODE_TOKEN=your-private-t3code-bearer-token
+   ```sh
+   npm run setup
+   ```
 
-```
+   Setup saves answers privately in `.env`, generates a missing installation secret, derives the callback/webhook URLs and provides a pre-filled Linear application link. Review that form in your workspace, fill in **your developer name**, review the website and agent settings, and paste the generated Client ID, Client secret and webhook signing secret when prompted. If you already created the app, use it; do not create another. Webhooks must include **Agent Session events and Issue updates**. No field unsupported by Linear's manifest is claimed to be pre-filled.
 
-In Linear **Settings → Projects → Labels**, create exactly one project label group named **T3Code project**. Add a child label whose plain-text name exactly matches the T3Code project title, including case and spaces, and select it on the Linear project containing your issue. For example, T3Code project **Payments API** uses child label **Payments API**. Apply the label to the project, not the issue. New Linear projects need only this label; no UUID mapping is required. See [Linear project labels](https://linear.app/docs/project-labels) and [routing and permissions](#routing-and-permissions).
+4. In Linear **Settings → Projects → Labels**, create exactly one **T3Code project** group. Add a child label whose name exactly matches your active T3Code project title, including case and spaces. Select that child on the **Linear project**, not the issue. When setup asks, supply an existing issue identifier from that project to check routing. Setup neither delegates it nor starts work. Model and workspace preferences come from T3Code; no UUIDs or routing JSON are needed.
 
-### 2. Choose the public bridge address
+5. Start the bridge in another terminal:
 
-Configure your HTTPS proxy or tunnel to forward to `http://127.0.0.1:8787`. Use your own address wherever `https://your-domain.example` appears below:
+   ```sh
+   npm start
+   ```
 
-```dotenv
-BASE_URL=https://your-domain.example
-LINEAR_REDIRECT_URI=https://your-domain.example/linear/oauth/callback
-```
+   Complete the [existing app-actor OAuth installation](docs/operations.md#install-the-linear-app). Setup's first diagnostic run will report the missing installation until you do this. Then run:
 
-Expose `/linear/webhook`, `/linear/oauth/callback` and the protected `/linear/install` route. `/healthz` is optional. Keep the T3Code endpoint private. If your tunnel address changes, update `.env` and the Linear app's redirect and webhook URLs together, then restart the bridge.
+   ```sh
+   npm run setup
+   ```
 
-### 3. Create the Linear OAuth app
+   Reruns preserve saved settings and credentials. A completed run says **configuration and available connection checks passed**. Actual Linear webhook receipt, write permissions and end-to-end execution remain **unverified**. No coding task or draft PR is required to finish onboarding.
 
-Sign in as a workspace admin and open [Linear's new application form](https://linear.app/settings/api/applications/new), also available through **Settings → API**. Follow Linear's [agent setup documentation](https://linear.app/developers/agents) if the settings labels change.
+Use `npm run doctor` anytime for read-only diagnostics, or `npm run doctor -- --issue NOR-123` to inspect another project's association. Each check reports PASS, FAIL or UNVERIFIED and a repair step. Exit code 1 means setup is incomplete; 0 means available checks passed, with the displayed unverified checks still outstanding. Corrections use `npm run setup -- --replace KEY`; restart the bridge afterwards. If interrupted, just rerun setup. Keep `.env` private and never delete session or installation files to reconnect.
 
-1. Select the intended workspace and create an OAuth application. Choose a recognizable name, such as **T3Code Agent**; this is how users will identify it in Linear. For an internal deployment, keep its distribution private if offered.
-2. Fill in the application's description and developer details. Use your own application or repository URL for any required website field.
-3. Set the redirect URI to `https://your-domain.example/linear/oauth/callback`. It must exactly match `LINEAR_REDIRECT_URI`.
-4. Save the app. Copy its **Client ID** and **Client secret** into `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` in your private `.env` file.
-5. In the app's webhook settings, enable webhooks and set the URL to `https://your-domain.example/linear/webhook`.
-6. Select **Agent session events** in the webhook resource list and save. Copy the **webhook signing secret** into `LINEAR_WEBHOOK_SECRET`.
-
-Use the normal authorization-code OAuth flow. The bridge's installation URL requests `read`, `write`, `app:assignable` and `app:mentionable` with `actor=app`, so the installation acts as the agent. You do not need to create or manually paste an installed access token. A personal Linear API key is not a substitute for this app installation.
-
-Your Linear configuration should now contain:
-
-```dotenv
-LINEAR_CLIENT_ID=your-app-client-id
-LINEAR_CLIENT_SECRET=your-app-client-secret
-LINEAR_WEBHOOK_SECRET=your-app-webhook-signing-secret
-INSTALL_SECRET=your-own-random-secret-at-least-16-characters
-```
-
-Generate `INSTALL_SECRET` locally, for example with `openssl rand -hex 32`, and save the result in `.env`. This is a separate secret protecting the bridge's installation endpoint. Store credentials in the service environment or private configuration file, never in issues, commits or chat. A webhook endpoint test will only succeed after the bridge starts in the next step.
-
-### 4. Start and install the app
-
-From the bridge checkout:
-
-```sh
-npm run typecheck
-npm run build
-npm start
-```
-
-In another terminal, check the listener and signed webhook intake:
-
-```sh
-curl http://127.0.0.1:8787/healthz
-npm run smoke:webhook
-```
-
-Then privately open this URL in your browser, substituting your domain and install secret:
-
-```text
-https://your-domain.example/linear/install?install_secret=YOUR_INSTALL_SECRET
-```
-
-Choose the intended Linear workspace and authorize the app. The callback displays **T3Code bridge is installed in Linear** when installation succeeds. The bridge stores the access and refresh tokens privately at `TOKEN_STORE_PATH` (default `./data/linear-tokens.json`). Keep the install URL out of shared messages and proxy logs; the endpoint also accepts the secret in an Authorization Bearer header.
-
-Verify the installed app identity:
-
-```sh
-npm run smoke:linear
-```
-
-The health and smoke checks do not start a coding task or establish end-to-end readiness.
-
-### 5. Verify a disposable delegation
-
-Create a disposable repository and an issue in a labelled Linear project. Delegate that issue to your installed app, then verify its T3Code thread, selected workspace, draft PR and reported validation results. Send a follow-up and check that it updates the same PR. Exercise restart recovery, cancellation and question/approval replies using [the acceptance checklist](docs/acceptance/nor-173.md). To test Linear's native stop signal, open the active agent session's menu and select **Send stop request** (see [Linear's signal documentation](https://linear.app/developers/agent-signals)). Allow enough time to find the control before the test turn finishes.
-
-Use your own process supervisor for ongoing operation. An optional user-systemd template is included at [systemd/linear-t3code-agent.service.template](systemd/linear-t3code-agent.service.template). This project does not provision accounts, hosting or a supervisor.
+When ready for real work, configure the skills and status markers below, then delegate an issue to the installed app. Keep the service running using [macOS/Linux operations](docs/operations.md#keep-the-bridge-running). Contributor checks and disposable delivery exercises live separately in [maintainer verification](docs/maintainer-verification.md).
 
 ## Status-driven workflows
 
