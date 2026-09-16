@@ -1,3 +1,4 @@
+import { installLinear } from "./setup-install.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
@@ -84,14 +85,19 @@ async function setup() {
     await ask("LINEAR_WEBHOOK_SECRET", "Linear webhook signing secret (hidden)", true);
     console.log('Add a t3code YAML code block to your Linear project detailed description (see README → Project configuration). Set project to the exact active T3Code project title and map your team status names to prompts and outputs. No UUID mapping is needed.');
     await ask("SETUP_ISSUE", "An existing issue identifier in that project (read-only check; no delegation)");
-    console.log("Configuration saved privately. Run npm run build, then npm start in another terminal. Complete the existing app-actor OAuth installation using /linear/install and your saved INSTALL_SECRET (see docs/operations.md). Rerun setup after installation. No coding task is needed.");
+    return await installLinear({ ...values, ...process.env }, args, () => lines.next());
   } finally { rl.close(); }
 }
 try {
-  if (mode === "setup") await setup();
-  else if (mode !== "doctor") throw new Error("Usage: npm run setup [-- --replace KEY] or npm run doctor [-- --issue NOR-123]");
-  const { doctor } = await import("./doctor.js");
-  process.exitCode = await doctor({ ...values, ...process.env }, args);
+  if (mode !== "setup" && mode !== "doctor") throw new Error("Usage: npm run setup [-- --replace KEY] [--no-browser] [--reconnect-linear] or npm run doctor [-- --issue NOR-123]");
+  const ready = mode === "doctor" || await setup();
+  if (ready) {
+    const { doctor } = await import("./doctor.js");
+    process.exitCode = await doctor({ ...values, ...process.env }, args);
+  } else {
+    console.log("Setup paused before Linear authorization completed. Saved settings are preserved; rerun npm run setup to continue. Use npm run doctor for independent diagnostics.");
+    process.exitCode = 1;
+  }
 } catch (error) {
   // Never echo raw network errors, command output or supplied values.
   console.error(error instanceof Error && /^(Setup interrupted|Use --replace|Usage:|Value contains)/.test(error.message) ? error.message : "Setup could not read or save private configuration. Check file access and rerun; existing session and installation state was not reset.");
