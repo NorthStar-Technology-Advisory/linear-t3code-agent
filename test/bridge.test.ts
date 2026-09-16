@@ -246,6 +246,7 @@ test("signed delegation creates one isolated configured T3Code turn and reports 
   assert.equal((await f.send(delegation())).status, 200);
   await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
+  assert.equal(f.commands.find(c => c.type === "thread.create").title, "Make a change");
   const start = f.commands.find(c => c.type === "thread.turn.start");
   assert.ok(start);
   assert.deepEqual(start.modelSelection, { instanceId: "codex", model: "test-model" });
@@ -445,8 +446,8 @@ test("missing prerequisites reach T3Code for clarification and explicit answers 
   assert.match(start.message.text, /required material is unavailable, pause.*before stage execution/);
   const thread = [...f.threads.values()][0];
   thread.activities.push({ id: "prerequisite", kind: "user-input.requested", tone: "info", summary: "Comments are unavailable; are they required?", turnId: thread.latestTurn.turnId, payload: { requestId: "missing-comments", questions: [{ id: "required", question: "Are comments required?" }] } });
-  await f.tick();
   await f.send(followup("later-work", "Then update the README"));
+  await f.tick();
   await f.restart(); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
   await f.send(followup("waiver", 'answer missing-comments {"required":"Comments are optional; continue with the available description."}'));
@@ -507,7 +508,7 @@ test("event catch-up restores a pending question omitted from the bounded snapsh
   // Real snapshots retain only 500 activities. This request exists in the event log alone.
   f.events.push({ type: "thread.activity-appended", sequence: 3, payload: { threadId: thread.id, activity: { id: "older-request", kind: "user-input.requested", tone: "info", summary: "Missing design", turnId: thread.latestTurn.turnId, payload: { requestId: "old-question", questions: [{ id: "design", question: "Where is the required design?" }] } } } });
   await f.restart(); await f.tick();
-  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /old-question/.test(a.content.body)));
+  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /Where is the required design/.test(a.content.body)));
 });
 
 test("stop acknowledgement cannot release queued work until the provider has stopped", async t => {
@@ -564,7 +565,7 @@ test("large replay gaps reconcile fresh snapshots and pinned requests, then resu
   f.faults.replayFallback = true;
   await f.restart(); await f.tick();
   assert.ok(f.activities.some(a => /intermediate progress details are unavailable/.test(a.content.body)));
-  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /pinned-1/.test(a.content.body)));
+  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /Choose/.test(a.content.body)));
   await f.send(followup("pinned-answer", 'answer pinned-1 {"choice":"A"}')); await f.tick();
   await f.send(followup("next-after-gap", "Next task")); finish(f); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
@@ -579,9 +580,9 @@ test("blank answers stay unsubmitted and definitively rejected answers can be co
   await f.send(followup("blank", 'answer correctable {"choice":""}')); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.user-input.respond").length, 0);
   f.faults.rejectAnswer = true;
-  await f.send(followup("rejected", 'answer correctable {"choice":"invalid"}')); await f.tick();
-  assert.ok(f.activities.some(a => /rejected the response/.test(a.content.body)));
-  await f.send(followup("corrected", 'answer correctable {"choice":"valid"}')); await f.tick();
+  await f.send(followup("rejected", "invalid")); await f.tick();
+  assert.ok(f.activities.some(a => /rejected your answer/.test(a.content.body)));
+  await f.send(followup("corrected", "valid")); await f.tick();
   assert.deepEqual(f.commands.find(c => c.type === "thread.user-input.respond").answers, { choice: "valid" });
 });
 
@@ -650,7 +651,7 @@ test("provider response failures retain correlation until resolution across rest
     assert.equal(f.commands.filter(c => c.type === commandType).length, 1);
     thread.activities.push({ id: id + "-failed", kind: "provider." + kind + ".respond.failed", tone: "error", summary: "Provider response failed", turnId: null, payload: { requestId: id } });
     await f.tick(); await f.restart();
-    assert.ok(f.activities.some(a => a.content.type === "elicitation" && /failed/i.test(a.content.body) && a.content.body.includes(id)));
+    assert.ok(f.activities.some(a => a.content.type === "elicitation" && /failed|could not accept/i.test(a.content.body) && (kind === "user-input" || a.content.body.includes(id))));
     await f.send(followup(id + "-retry", body)); await f.tick();
     assert.equal(f.commands.filter(c => c.type === commandType).length, 2);
     thread.activities.push({ id: id + "-resolved", kind: kind + ".resolved", tone: "info", summary: "Resolved", turnId: thread.latestTurn.turnId, payload: { requestId: id } });
@@ -965,7 +966,9 @@ test("status transitions stop first, honor new-thread and preserve the workspace
   assert.equal(turns[1].threadId, first.id);
   assert.match(turns[1].message.text, /\$to-tickets/);
   f.faults.deferStop = false;
+  f.issueOverrides["issue-1"].title = "Test issue for T3code connectivity";
   move(f, "implement"); await f.send(statusEvent("transition-3")); await f.tick(14);
+  assert.equal(f.commands.filter(c => c.type === "thread.create").at(-1).title, "Test issue for T3code connectivity");
   turns = f.commands.filter(c => c.type === "thread.turn.start");
   assert.equal(turns.length, 3);
   assert.notEqual(turns[2].threadId, first.id);
@@ -1101,17 +1104,45 @@ test("ticket revision adopts an existing dependency identity before later remova
   assert.equal(f.relations.length, 0);
 });
 
-test("grilling questions and answers are retained as parent comments", async t => {
+test("grilling stays in the sidebar with natural replies and no copied transcript in fresh threads", async t => {
   const f = await fixture(t);
   move(f, "grill-me"); await f.send(delegation()); await f.tick();
   const thread = [...f.threads.values()][0];
-  thread.activities.push({ id: "qa-activity", kind: "user-input.requested", summary: "Audience?", tone: "info", turnId: thread.latestTurn.turnId, payload: { requestId: "qa-request", questions: [{ id: "audience", question: "Who is the audience?" }] } });
+  thread.activities.push({ id: "qa-activity", kind: "user-input.requested", summary: "Audience?", tone: "info", turnId: thread.latestTurn.turnId, payload: { requestId: "qa-request", responseMode: "message", questions: [{ id: "audience", question: "Who is the audience?", options: [{ label: "Operators", description: "Internal users" }, { label: "Customers" }] }] } });
   await f.tick();
-  await f.send(followup("qa-answer", 'answer qa-request {"audience":"Operators"}')); await f.tick();
-  assert.ok(f.comments.some(c => /Who is the audience/.test(c.body)));
-  assert.ok(f.comments.some(c => /Operators/.test(c.body)));
-  await f.restart(); await f.tick();
-  assert.equal(f.comments.filter(c => /Who is the audience/.test(c.body)).length, 1);
+  const question = f.activities.find(a => a.content.type === "elicitation").content.body;
+  assert.match(question, /Who is the audience/); assert.match(question, /A\.\*\* Operators — Internal users/);
+  assert.doesNotMatch(question, /qa-request|responseMode|requestId|JSON/);
+  await f.restart();
+  await f.send(followup("wrong-question", "2B")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.user-input.respond").length, 0);
+  assert.match(f.activities.filter(a => a.content.type === "elicitation").at(-1).content.body, /does not match the current question/);
+  await f.send(followup("qa-answer", "1A")); await f.send(followup("qa-answer", "1A")); await f.tick();
+  const answers = f.commands.filter(c => c.type === "thread.user-input.respond");
+  assert.equal(answers.length, 1); assert.deepEqual(answers[0].answers, { audience: "Operators" });
+  assert.equal(f.comments.length, 0);
+  await f.restart();
+  move(f, "implement"); await f.send(statusEvent("fresh-thread")); await f.tick(14);
+  const turn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  assert.notEqual(turn.threadId, thread.id);
+  assert.doesNotMatch(turn.message.text, /Who is the audience|Submitted reply:/);
+  assert.equal(f.comments.length, 0);
+});
+
+test("several questions collect natural answers one at a time across restart", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const thread = [...f.threads.values()][0];
+  thread.activities.push({ id: "multi-question", kind: "user-input.requested", summary: "Details", tone: "info", turnId: thread.latestTurn.turnId, payload: { requestId: "details", questions: [
+    { id: "audience", question: "Who will use this?" },
+    { id: "checks", question: "Which checks?", multiSelect: true, options: [{ label: "Lint" }, { label: "Tests" }] },
+  ] } });
+  await f.tick();
+  await f.send(followup("first-answer", "Our support team")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.user-input.respond").length, 0);
+  assert.match(f.activities.filter(a => a.content.type === "elicitation").at(-1).content.body, /Question 2[\s\S]*Which checks/);
+  await f.restart(); await f.send(followup("second-answer", "2A, 2B")); await f.tick();
+  assert.deepEqual(f.commands.find(c => c.type === "thread.user-input.respond").answers, { audience: "Our support team", checks: ["Lint", "Tests"] });
 });
 
 test("delegated implementation child gets fresh parent specification and decisions", async t => {
