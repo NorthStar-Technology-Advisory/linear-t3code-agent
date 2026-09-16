@@ -79,10 +79,10 @@ export async function doctor(values: NodeJS.ProcessEnv, args: string[]): Promise
     try {
       const data = await query<{ issue: { project: { id: string } | null } | null }>("query DoctorIssue($id: String!) { issue(id: $id) { project { id } } }", { id: issue });
       selected = matchProject(projects, await projectTitle(query, data.issue?.project?.id));
-      report("PASS", "project association", "Exactly one active T3Code project matches the selected project label.");
+      report("PASS", "project association", "Project YAML is valid, team/status names resolve, and exactly one active T3Code project matches.");
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      const reason = /Multiple T3Code/.test(message) ? "Multiple active T3Code projects match; give them unique titles." : /No active T3Code/.test(message) ? "No active T3Code project matches; correct the exact title, including case and spaces." : "Select exactly one child in the single T3Code project label group on the issue's Linear project; verify project access.";
+      const reason = /Multiple T3Code/.test(message) ? "Multiple active T3Code projects match; give them unique titles." : /No active T3Code/.test(message) ? "No active T3Code project matches; correct the exact title, including case and spaces." : "Check the t3code YAML block in the project detailed description, team keys, status names and project access.";
       report("FAIL", "project association", reason);
     }
   }

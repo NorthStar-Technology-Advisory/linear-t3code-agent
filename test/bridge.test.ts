@@ -1,3 +1,4 @@
+import { stringify } from "yaml";
 import { WebSocketServer } from "ws";
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
@@ -44,7 +45,12 @@ async function fixture(t: TestContext) {
   const settings: any = { defaultModelSelection: { instanceId: "codex", model: "inherited-model" }, defaultThreadEnvMode: "worktree", newWorktreesStartFromOrigin: false, providerInstances: { codex: { enabled: true } }, providers: {} };
   const skills = ["grill-me", "to-spec", "to-tickets", "implement"].map(name => ({ name, path: `/skills/${name}/SKILL.md`, enabled: true }));
   const providers = [{ instanceId: "codex", enabled: true, installed: true, availability: "available", models: [{ slug: "test-model" }, { slug: "inherited-model" }] }];
-  const labels = { groups: [{ id: "group", name: "T3Code project", isGroup: true, parent: null }], selected: [{ id: "label", name: "Test project", isGroup: false, parent: { id: "group" } }] };
+  const projectConfig: any = { t3code: { version: 1, project: "Test project", workflows: [{ team: "NOR", statuses: Object.fromEntries(
+    [ ["grill-me", "comment"], ["to-spec", "specification"], ["to-tickets", "tickets"], ["implement", "draft-pr"] ].map(([name, output]) => [name, {
+      prompt: `Use $${name} for this issue.`, output, "required-skills": [name], ...(name === "implement" ? { "new-thread": true } : {}),
+    }])) }] } };
+  const projectDocument = { content: undefined as string | undefined };
+  const statusNodes = ["grill-me", "to-spec", "to-tickets", "implement", "review"].map(name => ({ id: name, name }));
   let sequence = 0;
   const issueOverrides: Record<string, any> = {};
   let heldIssueRead: { remaining: number; entered: () => void; wait: Promise<void> } | undefined;
@@ -101,11 +107,12 @@ async function fixture(t: TestContext) {
       } else if (query.includes("BridgeActivity")) {
         if (faults.linearDown) { res.statusCode = 503; res.end('{}'); return; }
         res.end(JSON.stringify({ data: { agentSession: { activities: { nodes: activities.filter(a => a.id === variables.id).map(a => ({ id: a.id })) } } } }));
-      } else if (query.includes("BridgeProjectGroups")) {
-        res.end(JSON.stringify({ data: { projectLabels: { nodes: labels.groups, pageInfo: { hasNextPage: false } } } }));
-      } else if (query.includes("BridgeProjectLabels")) {
-        res.end(JSON.stringify({ data: { project: { labels: { nodes: labels.selected, pageInfo: { hasNextPage: false } } } } }));
-      } else {
+      } else if (query.includes("BridgeProjectConfig")) {
+        res.end(JSON.stringify({ data: { project: { content: projectDocument.content ?? "Project prose\n\n```yaml\n" + stringify(projectConfig) + "```" } } }));
+      } else if (query.includes("BridgeProjectTeams")) {
+        res.end(JSON.stringify({ data: { project: { teams: { nodes: [{ id: "team-1", key: "NOR" }], pageInfo: { hasNextPage: false } } } } }));
+      } else if (query.includes("BridgeTeamStatuses")) {
+        res.end(JSON.stringify({ data: { team: { states: { nodes: statusNodes, pageInfo: { hasNextPage: false } } } } }));      } else {
         reads.push(variables);
         res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
       }
@@ -217,7 +224,7 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify({ type: "AgentSessionEvent", webhookTimestamp: Date.now(), ...payload });
     return fetch(url + "/linear/webhook", { method: "POST", headers: { "content-type": "application/json", "linear-signature": signature ? createHmac("sha256", "webhook-secret").update(body).digest("hex") : "bad" }, body });
   };
-  return { linearSessions, artifactWrites, comments, relations, skills, projects, settings, providers, labels, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
+  return { linearSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
     holdIssueRead: (remaining: number) => {
       let release!: () => void;
       let entered!: () => void;
@@ -780,23 +787,21 @@ test("new worktree uses T3Code bootstrap from repository default and inherits st
 });
 
 test("routing errors pause until correction and explicit resume; duplicate delivery never retries", async t => {
-  const cases = ["missing group", "ambiguous group", "missing selection", "multiple selections", "unknown", "case mismatch", "deleted", "duplicate"];
+  const cases = ["missing block", "multiple blocks", "unknown", "case mismatch", "deleted", "duplicate"];
   for (const scenario of cases) await t.test(scenario, async t => {
     const f = await fixture(t);
-    const originalGroups = structuredClone(f.labels.groups), originalLabels = structuredClone(f.labels.selected), originalProjects = structuredClone(f.projects);
-    if (scenario === "missing group") f.labels.groups = [];
-    if (scenario === "ambiguous group") f.labels.groups.push({ ...f.labels.groups[0]!, id: "other-group" });
-    if (scenario === "missing selection") f.labels.selected = [];
-    if (scenario === "multiple selections") f.labels.selected.push({ ...f.labels.selected[0]!, id: "second-label" });
-    if (scenario === "unknown") f.labels.selected[0]!.name = "Unknown";
-    if (scenario === "case mismatch") f.labels.selected[0]!.name = "test project";
+    const originalProjects = structuredClone(f.projects);
+    if (scenario === "missing block") f.projectDocument.content = "No configuration";
+    if (scenario === "multiple blocks") f.projectDocument.content = ("```yaml\n" + stringify(f.projectConfig) + "```\n").repeat(2);
+    if (scenario === "unknown") f.projectConfig.t3code.project = "Unknown";
+    if (scenario === "case mismatch") f.projectConfig.t3code.project = "test project";
     if (scenario === "deleted") f.projects[0]!.deletedAt = new Date().toISOString();
     if (scenario === "duplicate") f.projects.push({ ...f.projects[0]!, id: "duplicate", workspaceRoot: "/another/checkout" });
     await f.send(delegation()); await f.tick();
     assert.equal(f.commands.length, 0);
     assert.ok(f.activities.some(a => a.content.type === "error" && /resume/.test(a.content.body)));
     if (scenario === "duplicate") { const message = f.activities.map(a => a.content.body).join("\n"); assert.ok(message.includes(f.repo)); assert.match(message, /\/another\/checkout/); }
-    f.labels.groups = originalGroups; f.labels.selected = originalLabels; f.projects.splice(0, f.projects.length, ...originalProjects);
+    f.projectDocument.content = undefined; f.projectConfig.t3code.project = "Test project"; f.projects.splice(0, f.projects.length, ...originalProjects);
     await f.restart(); await f.send(delegation()); await f.tick(); assert.equal(f.commands.length, 0);
     await f.send(followup("corrected", "resume")); await f.tick();
     assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
@@ -851,7 +856,7 @@ test("checkout reservation persists through idle feedback and restart, releasing
 test("established sessions retain settings and identity while new sessions resolve renamed projects", async t => {
   const f = await fixture(t); await f.send(delegation()); await f.tick(); finish(f); await f.tick();
   const first = [...f.threads.values()][0]; const branch = first.branch, worktree = first.worktreePath;
-  f.projects[0].title = "Renamed project"; f.labels.selected[0]!.name = "Renamed project";
+  f.projects[0].title = "Renamed project"; f.projectConfig.t3code.project = "Renamed project";
   f.projects[0].defaultModelSelection = { instanceId: "codex", model: "inherited-model" };
   await f.restart(); await f.send(delegation()); await f.send(followup("feedback", "Adjust the result")); await f.tick();
   const turns = f.commands.filter(c => c.type === "thread.turn.start");
@@ -957,23 +962,18 @@ test("unmarked delegated status does not start a workflow", async t => {
 });
 
 
-test("invalid status selections and missing skills fail before execution", async t => {
-  for (const description of ["t3code: unknown", "t3code: grill-me\nt3code: to-spec", "t3code: grill-me extra", "t3code: GRILL-ME", "t3code: grill-me"]) {
-    await t.test(description, async t => {
-      const f = await fixture(t);
-      f.skills.length = 0;
-      f.issueOverrides["issue-1"] = { state: { id: "planning", description, team: { id: "team-1" } } };
-      await f.send(delegation()); await f.tick();
-      assert.equal(f.commands.length, 0);
-      assert.ok(f.activities.some(a => a.content.type === "error" && /workflow|skill|marker/i.test(a.content.body)));
-    });
-  }
+test("missing required skills fail before execution", async t => {
+  const f = await fixture(t);
+  f.skills.length = 0;
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.length, 0);
+  assert.ok(f.activities.some(a => a.content.type === "error" && /skill/i.test(a.content.body)));
 });
 
-test("grilling completes without validation or PR and follow-ups retain selected skill after description edits", async t => {
+test("grilling completes without validation or PR and follow-ups retain the selected prompt after YAML edits", async t => {
   const f = await fixture(t);
   f.options.pullRequests.find = async () => null;
-  f.issueOverrides["issue-1"] = { state: { id: "planning", description: "t3code: grill-me", team: { id: "team-1" } } };
+  f.issueOverrides["issue-1"] = { state: { id: "grill-me", description: "Unused description", team: { id: "team-1" } } };
   await f.send(delegation()); await f.tick();
   const thread = [...f.threads.values()][0];
   thread.latestTurn.state = "completed";
@@ -981,7 +981,8 @@ test("grilling completes without validation or PR and follow-ups retain selected
   thread.messages.push({ id: "result", role: "assistant", turnId: thread.latestTurn.turnId, text: '<bridge-result>{"status":"complete","summary":"Decisions agreed","validation":[],"blockers":[],"context":{"read":["issue"],"summarized":[],"unavailable":[]}}</bridge-result>' });
   await f.tick();
   assert.ok(f.activities.some(a => a.content.type === "response" && /Decisions agreed/.test(a.content.body)));
-  f.issueOverrides["issue-1"].state.description = "t3code: implement";
+  f.projectConfig.t3code.workflows[0].statuses["grill-me"].prompt = "Changed prompt";
+  await f.restart();
   await f.send(followup("revise", "Revisit the audience")); await f.tick();
   const turns = f.commands.filter(c => c.type === "thread.turn.start");
   assert.equal(turns.length, 2);
@@ -995,7 +996,7 @@ function move(f: Awaited<ReturnType<typeof fixture>>, workflow: string, id = wor
   f.issueOverrides["issue-1"] = { ...f.issueOverrides["issue-1"], state: { id, description: workflow ? `t3code: ${workflow}` : "Review", team: { id: "team-1" }, type: "unstarted" } };
 }
 
-test("status transitions stop first, preserve planning conversation and workspace, and start fresh implementation", async t => {
+test("status transitions stop first, honor new-thread and preserve the workspace", async t => {
   const f = await fixture(t);
   move(f, "grill-me");
   await f.send(delegation()); await f.tick();
@@ -1024,7 +1025,7 @@ test("status transitions stop first, preserve planning conversation and workspac
   assert.equal(await readFile(path.join(first.worktreePath, "preserved.txt"), "utf8"), "keep me");
   move(f, "grill-me"); await f.send(statusEvent("transition-4")); await f.tick(14);
   turns = f.commands.filter(c => c.type === "thread.turn.start");
-  assert.equal(turns.at(-1).threadId, first.id);
+  assert.equal(turns.at(-1).threadId, implementation.id);
   await f.send(statusEvent("transition-4")); await f.restart(); await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 4);
 });
@@ -1345,4 +1346,65 @@ test("ticket keys matching object properties receive stable UUID identities", as
   await f.restart(); await f.send(followup("repeat-reserved-keys", "Keep the same scopes")); await f.tick();
   planningResult(f, { approved: true, children }); await f.tick(20);
   assert.equal(f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate")).length, 3);
+});
+
+test("custom status prompts and optional skills are independent of output contracts", async t => {
+  const f = await fixture(t);
+  f.skills.length = 0;
+  f.options.pullRequests.find = async () => null;
+  f.projectConfig.t3code.instructions = "Shared Zenith instructions.";
+  f.projectConfig.t3code.workflows[0].statuses = {
+    implement: { output: "comment", prompt: "Review the design.\n\nExplain the tradeoffs without coding." },
+  };
+  await f.send(delegation()); await f.tick();
+  const turn = f.commands.find(c => c.type === "thread.turn.start");
+  assert.match(turn.message.text, /Shared Zenith instructions/);
+  assert.match(turn.message.text, /Review the design\.\n\nExplain the tradeoffs/);
+  assert.doesNotMatch(turn.message.text, /Invoke \$implement|gh pr create/);
+  planningResult(f, {}, "Design reviewed"); await f.tick();
+  assert.ok(f.comments.some(c => /Design reviewed/.test(c.body)));
+  assert.ok(f.activities.some(a => a.content.type === "response" && /Design reviewed/.test(a.content.body)));
+});
+
+test("new-thread applies on re-entry but never on follow-ups or restart", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.implement = { output: "comment", "new-thread": true, prompt: "Review this issue." };
+  await f.send(delegation()); await f.tick();
+  const first = f.commands.find(c => c.type === "thread.turn.start");
+  planningResult(f, {}, "Reviewed"); await f.tick();
+  await f.restart(); await f.send(followup("review-followup", "Explain more")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").at(-1).threadId, first.threadId);
+  move(f, "", "review"); await f.send(statusEvent("holding")); await f.tick(12);
+  f.projectConfig.t3code.workflows[0].statuses.implement.prompt = "Review again with the updated instructions.";
+  move(f, "implement"); await f.send(statusEvent("reenter")); await f.tick(12);
+  const latest = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  assert.notEqual(latest.threadId, first.threadId);
+  assert.match(latest.message.text, /Review again with the updated instructions/);
+  assert.equal(f.threads.get(latest.threadId).worktreePath, f.threads.get(first.threadId).worktreePath);
+});
+
+test("long YAML prompts use a complete file without repeating oversized instructions in transport", async t => {
+  const f = await fixture(t);
+  const prompt = "Detailed project instruction.\n".repeat(5000) + "END OF YAML PROMPT";
+  f.projectConfig.t3code.workflows[0].statuses.implement.prompt = prompt;
+  await f.send(delegation()); await f.tick();
+  const text = f.commands.find(c => c.type === "thread.turn.start").message.text;
+  assert.ok(text.length < 100000);
+  const file = /complete delegated turn at (.+?) before acting/.exec(text);
+  assert.ok(file);
+  const full = await readFile(file[1], "utf8");
+  assert.ok(full.includes(prompt));
+  assert.match(full, /<bridge-result>/);
+});
+
+test("unknown configured status pauses even if a different status is selected", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.Missing = { prompt: "Review", output: "comment" };
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.length, 0);
+  assert.ok(f.activities.some(a => /Status "Missing"/.test(a.content.body)));
+  delete f.projectConfig.t3code.workflows[0].statuses.Missing;
+  await f.restart(); await f.tick(); assert.equal(f.commands.length, 0);
+  await f.send(followup("fixed-status", "resume")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
 });

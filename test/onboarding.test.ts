@@ -84,8 +84,9 @@ async function fixture(t: TestContext) {
       const query = JSON.parse(body).query; observed.push(query);
       if (query.includes("DoctorViewer")) return send({ data: { viewer: { id: "app", app: true } } });
       if (query.includes("DoctorIssue")) return send({ data: { issue: { project: { id: "linear-project" } } } });
-      const connection = { nodes: query.includes("BridgeProjectGroups") ? [{ id: "group", name: "T3Code project", isGroup: true, parent: null }] : [{ id: "label", name: state.unmatched ? "wrong title" : "Example project", isGroup: false, parent: { id: "group" } }], pageInfo: { hasNextPage: false } };
-      return send({ data: query.includes("BridgeProjectGroups") ? { projectLabels: connection } : { project: { labels: connection } } });
+      if (query.includes("BridgeProjectConfig")) return send({ data: { project: { content: `\`\`\`yaml\nt3code:\n  version: 1\n  project: "${state.unmatched ? "wrong title" : "Example project"}"\n  workflows:\n    - team: NOR\n      statuses:\n        Todo:\n          prompt: Implement this issue.\n          output: draft-pr\n\`\`\`` } } });
+      if (query.includes("BridgeProjectTeams")) return send({ data: { project: { teams: { nodes: [{ id: "team-1", key: "NOR" }], pageInfo: { hasNextPage: false } } } } });
+      return send({ data: { team: { states: { nodes: [{ id: "todo", name: "Todo" }], pageInfo: { hasNextPage: false } } } } });
     }
     if (req.url === "/api/orchestration/snapshot") {
       res.statusCode = state.t3Status;

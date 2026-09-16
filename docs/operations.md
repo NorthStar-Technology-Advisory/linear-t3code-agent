@@ -1,6 +1,6 @@
 # Operations and troubleshooting
 
-Use the [quickstart](../README.md#quickstart-existing-linear-and-t3code-installations) first. Run one bridge process per database, on the same host/account as T3Code when possible. Remote setups require a shared filesystem with identical absolute repository, worktree and context paths. T3Code project labels are not filesystem sandboxes.
+Use the [quickstart](../README.md#quickstart-existing-linear-and-t3code-installations) first. Run one bridge process per database, on the same host/account as T3Code when possible. Remote setups require a shared filesystem with identical absolute repository, worktree and context paths. T3Code project selection is not a filesystem sandbox.
 
 ## Credentials and reconnection
 
@@ -79,7 +79,7 @@ Arrange user lingering through your administrator if it must run without login. 
 
 ## Read-only diagnosis
 
-`npm run doctor` works with incomplete configuration. It checks tools, runtime config, T3Code auth/contracts, installed Linear app identity, selected project labels and inherited settings, repository/Git access, GitHub authentication, context storage access, local health and public HTTPS. Supply `-- --issue NOR-123` to override the saved setup issue. An issue is read only; delegation/status is not changed.
+`npm run doctor` works with incomplete configuration. It checks tools, runtime config, T3Code auth/contracts, installed Linear app identity, project YAML, team/status mappings and inherited settings, repository/Git access, GitHub authentication, context storage access, local health and public HTTPS. Supply `-- --issue NOR-123` to override the saved setup issue. An issue is read only; delegation/status is not changed.
 
 Each failed check gives a repair step. Authentication rejection means renew/reinstall the credential; connection failure means repair the service/address/network; contract failures mean check scopes and installed versions. Missing project association means select one matching child label on the Linear project. Ambiguous active T3Code titles must be made unique. After fixing, rerun doctor. A repaired connection does not automatically resume paused coding sessions; follow the existing `resume` rules when appropriate.
 
