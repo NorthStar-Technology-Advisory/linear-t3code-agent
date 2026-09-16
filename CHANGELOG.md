@@ -1,5 +1,25 @@
 # Changelog
 
+## NOR-197 — artifact review fixes
+
+- Carry child and dependency identities into replacement sessions after provider stop.
+- Check child revisions against the context captured before the agent turn, preserving intervening human edits across restart.
+- Allocate ticket identities using own-property checks, including keys such as `constructor` and `__proto__`.
+
+## NOR-197 — review fixes
+
+- Resolve the current issue session from Linear's session chronology, stop superseded providers before replacement work, and reject stale session follow-ups.
+- Retire publication on explicit cancellation and guard writes after asynchronous preflight reads.
+- Keep rejected publication preparation incomplete and allow corrected feedback without a false completion response.
+
+## NOR-197 — status-driven workflows
+
+- Select grilling, specification, tickets or implementation through team status-description markers and explicit delegation.
+- Preserve planning context, start fresh implementation conversations, stop superseded stages and retain workspace/PR state.
+- Publish and reconcile native Linear artifacts with durable identities; retain Q&A and revision summaries in parent comments.
+- Verify installed workspace skills, refresh parent/child context and distinguish planning completion from implementation delivery.
+- Document operator setup, human progression and recovery; see the NOR-197 acceptance record for live coverage limits.
+
 ## Unreleased
 
 ### NOR-173: Linear ↔ T3Code bridge

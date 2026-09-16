@@ -46,6 +46,15 @@ export class T3CodeRunner implements Runner {
     catch { throw new IntegrationError("T3Code returned invalid JSON. Check the current orchestration contract.", false); }
   }
 
+  async skill(name: string, repository: string, instanceId: string): Promise<string> {
+    const skillSchema = z.object({ name: z.string(), path: z.string(), enabled: z.boolean(), userInvocable: z.boolean().optional() });
+    const result = z.object({ providers: z.array(z.object({ instanceId: z.string(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) }).safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
+    const skills = result.success ? result.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
+    const matches = skills?.filter(s => s.name === name && s.enabled && s.userInvocable !== false) ?? [];
+    if (matches.length !== 1) throw new IntegrationError(`Workflow skill ${name} is unavailable or ambiguous for ${instanceId} in ${repository}. Install/enable it in the T3Code execution environment, verify workspace skill discovery, then send resume. The bridge does not install skills.`, false);
+    return matches[0]!.path;
+  }
+
   async projects() {
     const parsed = z.object({ projects: z.array(z.object({ id: z.string(), title: z.string(), workspaceRoot: z.string(), deletedAt: z.string().nullable(), defaultModelSelection: ModelSchema.nullable(), defaultThreadEnvMode: WorkspaceMode.nullish() })) }).safeParse(await this.request("/api/orchestration/snapshot"));
     if (!parsed.success) throw new IntegrationError("T3Code snapshot contract changed; expected projects with workspaceRoot.", false);

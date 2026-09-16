@@ -5,14 +5,18 @@ import { linearGraphql, createAgentActivity, getAccessToken, type AgentActivityC
 export type IssueContext = {
   id: string; identifier: string; title: string; description: string | null; url: string;
   project: { id: string } | null; team: { id: string };
+  state: { id: string; description: string | null; team: { id: string }; type: string };
+  delegate: { id: string } | null; parent: { id: string } | null; delegated: boolean;
 };
 type Comment = { id: string; body: string; createdAt: string; user: { name: string } | null; externalUser?: { name: string } | null; botActor?: { name: string } | null };
 type Attachment = { id: string; title: string; url: string; bodyData?: string | null };
 type Relation = { type: string; issue?: { id: string; url: string }; relatedIssue?: { id: string; url: string } };
 type Connection<T> = { nodes: T[]; pageInfo: { hasNextPage: boolean; endCursor?: string } };
 export type ContextInventory = { source: string; status: "supplied" | "unavailable" | "externally delegated"; detail: string }[];
-export type CollectedContext = { text: string; fingerprint: string; inventory: ContextInventory; unavailable: string[] };
+export type IssueRevision = Pick<IssueContext, "title" | "description">;
+export type CollectedContext = { issueRevisions: Record<string, IssueRevision>; text: string; fingerprint: string; inventory: ContextInventory; unavailable: string[] };
 const fields = {
+  children: "id identifier title description url state { id type description team { id } } delegate { id } parent { id } project { id } team { id }",
   comments: "id body createdAt user { name } externalUser { name } botActor { name }",
   attachments: "id title url bodyData",
   relations: "type relatedIssue { id url }",
@@ -25,9 +29,29 @@ export class LinearClient {
     return linearGraphql<T>(query, variables, { endpoint: this.endpoint, tokenPath: this.tokenPath });
   }
   async issue(id: string): Promise<IssueContext> {
-    const data = await this.query<{ issue: IssueContext | null }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id } team { id } } }`, { id });
+    const data = await this.query<{ issue: IssueContext | null; viewer: { id: string } }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id } team { id } state { id description type team { id } } delegate { id } parent { id } } viewer { id } }`, { id });
     if (!data.issue) throw new Error("Linear issue is unavailable; restore access and resume.");
-    return data.issue;
+    return { ...data.issue, delegated: Boolean(data.issue.delegate && data.issue.delegate.id === data.viewer?.id) };
+  }
+  async currentSession(issueId: string): Promise<string> {
+    type AgentSession = { id: string; createdAt: string; appUser: { id: string } };
+    const sessions: AgentSession[] = [];
+    const cursors = new Set<string>();
+    let after: string | undefined;
+    do {
+      const data = await this.query<{ viewer: { id: string }; issue: { agentSessions: Connection<AgentSession> } | null }>(`query BridgeCurrentSession($id: String!, $after: String) { viewer { id } issue(id: $id) { agentSessions(first: 100, after: $after, includeArchived: true) { nodes { id createdAt appUser { id } } pageInfo { hasNextPage endCursor } } } }`, { id: issueId, after });
+      const connection = data.issue?.agentSessions;
+      if (!connection || !data.viewer?.id) throw new Error("Current Linear session identity is unavailable; no work can start until ownership is verified.");
+      sessions.push(...connection.nodes.filter(session => session.appUser.id === data.viewer.id));
+      if (!connection.pageInfo.hasNextPage) break;
+      after = connection.pageInfo.endCursor;
+      if (!after || cursors.has(after)) throw new Error("Linear session pagination did not advance; ownership could not be verified.");
+      cursors.add(after);
+    } while (true);
+    if (sessions.some(session => !Number.isFinite(Date.parse(session.createdAt)))) throw new Error("Linear session chronology is invalid; ownership could not be verified.");
+    sessions.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    if (!sessions[0] || (sessions[1] && Date.parse(sessions[0].createdAt) === Date.parse(sessions[1].createdAt))) throw new Error("Current Linear session is missing or ambiguous; no work can start until ownership is verified.");
+    return sessions[0].id;
   }
   async projectTitle(projectId: string | undefined): Promise<string> {
     const correction = 'Configure the Linear project label group "T3Code project" with exactly one selected child whose name matches a T3Code project title, then send resume.';
@@ -77,6 +101,7 @@ export class LinearClient {
     const inventory: ContextInventory = [];
     const unavailable: string[] = [];
     const documents: unknown[] = [];
+    const issueRevisions: Record<string, IssueRevision> = {};
     const urls = new Set<string>();
     const missing = (source: string) => { unavailable.push(source); inventory.push({ source, status: "unavailable", detail: "Could not retrieve; no content omitted silently." }); };
     const collect = async (current: IssueContext, root: boolean): Promise<string[]> => {
@@ -91,13 +116,17 @@ export class LinearClient {
       const relations = await read<Relation>("relations");
       const inverse = await read<Relation>("inverseRelations");
       const related = [...relations, ...inverse].map(r => r.relatedIssue ?? r.issue).filter(r => r !== undefined);
-      const doc = { issue: current, comments, attachments, furtherLinks: related };
+      const children = await read<IssueContext>("children");
+      for (const supplied of [current, ...children]) {
+        if (!Object.hasOwn(issueRevisions, supplied.id)) issueRevisions[supplied.id] = { title: supplied.title, description: supplied.description };
+      }
+      const doc = { issue: current, comments, attachments, children, furtherLinks: related };
       documents.push(doc);
       for (const match of JSON.stringify(doc).matchAll(/https?:\/\/[^\s"<>\\]+/g)) urls.add(match[0].replace(/[),.;]+$/, ""));
       for (const attachment of attachments) {
         if (attachment.bodyData) inventory.push({ source: attachment.url, status: "supplied", detail: `Attachment body: ${attachment.title}` });
       }
-      return root ? related.map(r => r.id) : [];
+      return root ? [...related.map(r => r.id), ...(current.parent ? [current.parent.id] : []), ...children.map(child => child.id)] : [];
     };
     const relatedIds = await collect(issue, true);
     for (const id of new Set(relatedIds.filter(id => id !== issue.id))) {
@@ -118,7 +147,7 @@ export class LinearClient {
       }
     }
     const text = JSON.stringify({ documents, inventory }, null, 2);
-    return { text, inventory, unavailable, fingerprint: createHash("sha256").update(text).digest("hex") };
+    return { issueRevisions, text, inventory, unavailable, fingerprint: createHash("sha256").update(text).digest("hex") };
   }
 
   private async downloadAttachment(url: URL, directory: string): Promise<string> {
@@ -136,6 +165,14 @@ export class LinearClient {
     const file = path.join(directory, createHash("sha256").update(url.href).digest("hex") + suffix);
     await writeFile(file, Buffer.concat(chunks), { mode: 0o600 });
     return file;
+  }
+
+  async comment(issueId: string, body: string, id: string, isCurrent: () => boolean = () => true): Promise<void> {
+    const data = await this.query<{ issue: { comments: { nodes: Array<{ id: string }> } } }>(`query BridgeArtifactComment($id: String!, $commentId: ID!) { issue(id: $id) { comments(filter: { id: { eq: $commentId } }, first: 1) { nodes { id } } } }`, { id: issueId, commentId: id });
+    if (data.issue.comments.nodes.some(c => c.id === id)) return;
+    if (!isCurrent()) return;
+    const result = await this.query<{ commentCreate: { success: boolean } }>(`mutation BridgeArtifactCommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`, { input: { id, issueId, body } });
+    if (!result.commentCreate.success) throw new Error("Linear discussion publication failed; retry will reconcile its retained identity.");
   }
 
   async activity(sessionId: string, content: AgentActivityContent, id: string, reconcile = false) {
