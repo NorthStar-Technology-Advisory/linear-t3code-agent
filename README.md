@@ -75,9 +75,9 @@ Run the bridge on the **same host as T3Code**, under the account with access to 
    npm start
    ```
 
-   Setup opens Linear in your browser. Choose the intended workspace and approve the app. **The credentials identify your app; this one-time approval authorizes it to access the workspace.** Setup handles the installation secret internally—there is no extra secret to find or paste. It detects the saved installation automatically and runs diagnostics.
+   Setup displays a clickable Linear authorization link. Open it, choose the intended workspace and approve the app. **The credentials identify your app; this one-time approval authorizes it to access the workspace.** Setup handles the installation secret internally—there is no extra secret to find or paste. It detects the saved installation automatically and runs diagnostics.
 
-   If a browser cannot open, setup prints a direct Linear authorization link. Use `npm run setup -- --no-browser` to request that link explicitly. If the link expires or the browser reports an error, correct the problem and press Enter in setup to retry. Ctrl+C safely stops setup; rerunning preserves saved answers and completed installation.
+   Setup never launches a browser automatically. It also prints the full URL so you can copy it or open it on another device if your terminal does not support clickable links. If the link expires or the browser reports an error, correct the problem and press Enter in setup to retry. Ctrl+C safely stops setup; rerunning preserves saved answers and completed installation.
 
    A completed run says **configuration and available connection checks passed**. Actual Linear webhook receipt, write permissions and end-to-end execution remain **unverified**. No coding task or draft PR is required to finish onboarding.
 

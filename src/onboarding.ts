@@ -89,7 +89,7 @@ async function setup() {
   } finally { rl.close(); }
 }
 try {
-  if (mode !== "setup" && mode !== "doctor") throw new Error("Usage: npm run setup [-- --replace KEY] [--no-browser] [--reconnect-linear] or npm run doctor [-- --issue NOR-123]");
+  if (mode !== "setup" && mode !== "doctor") throw new Error("Usage: npm run setup [-- --replace KEY] [--reconnect-linear] or npm run doctor [-- --issue NOR-123]");
   const ready = mode === "doctor" || await setup();
   if (ready) {
     const { doctor } = await import("./doctor.js");
