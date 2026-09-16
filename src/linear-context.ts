@@ -13,7 +13,8 @@ type Attachment = { id: string; title: string; url: string; bodyData?: string | 
 type Relation = { type: string; issue?: { id: string; url: string }; relatedIssue?: { id: string; url: string } };
 type Connection<T> = { nodes: T[]; pageInfo: { hasNextPage: boolean; endCursor?: string } };
 export type ContextInventory = { source: string; status: "supplied" | "unavailable" | "externally delegated"; detail: string }[];
-export type CollectedContext = { text: string; fingerprint: string; inventory: ContextInventory; unavailable: string[] };
+export type IssueRevision = Pick<IssueContext, "title" | "description">;
+export type CollectedContext = { issueRevisions: Record<string, IssueRevision>; text: string; fingerprint: string; inventory: ContextInventory; unavailable: string[] };
 const fields = {
   children: "id identifier title description url state { id type description team { id } } delegate { id } parent { id } project { id } team { id }",
   comments: "id body createdAt user { name } externalUser { name } botActor { name }",
@@ -100,6 +101,7 @@ export class LinearClient {
     const inventory: ContextInventory = [];
     const unavailable: string[] = [];
     const documents: unknown[] = [];
+    const issueRevisions: Record<string, IssueRevision> = {};
     const urls = new Set<string>();
     const missing = (source: string) => { unavailable.push(source); inventory.push({ source, status: "unavailable", detail: "Could not retrieve; no content omitted silently." }); };
     const collect = async (current: IssueContext, root: boolean): Promise<string[]> => {
@@ -115,6 +117,9 @@ export class LinearClient {
       const inverse = await read<Relation>("inverseRelations");
       const related = [...relations, ...inverse].map(r => r.relatedIssue ?? r.issue).filter(r => r !== undefined);
       const children = await read<IssueContext>("children");
+      for (const supplied of [current, ...children]) {
+        if (!Object.hasOwn(issueRevisions, supplied.id)) issueRevisions[supplied.id] = { title: supplied.title, description: supplied.description };
+      }
       const doc = { issue: current, comments, attachments, children, furtherLinks: related };
       documents.push(doc);
       for (const match of JSON.stringify(doc).matchAll(/https?:\/\/[^\s"<>\\]+/g)) urls.add(match[0].replace(/[),.;]+$/, ""));
@@ -142,7 +147,7 @@ export class LinearClient {
       }
     }
     const text = JSON.stringify({ documents, inventory }, null, 2);
-    return { text, inventory, unavailable, fingerprint: createHash("sha256").update(text).digest("hex") };
+    return { issueRevisions, text, inventory, unavailable, fingerprint: createHash("sha256").update(text).digest("hex") };
   }
 
   private async downloadAttachment(url: URL, directory: string): Promise<string> {

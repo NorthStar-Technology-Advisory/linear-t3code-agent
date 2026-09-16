@@ -107,7 +107,7 @@ async function fixture(t: TestContext) {
         res.end(JSON.stringify({ data: { project: { labels: { nodes: labels.selected, pageInfo: { hasNextPage: false } } } } }));
       } else {
         reads.push(variables);
-        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: [], pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
+        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: "NOR-1", title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
       }
     } else {
       assert.equal(req.headers.authorization, "Bearer t3-secret");
@@ -1291,4 +1291,58 @@ test("cancellation during publication preflight prevents the pending mutation", 
   await f.restart(); await f.send(followup("discard-after-read", "Discard the previous draft")); await f.tick();
   assert.equal(f.artifactWrites.length, 0);
   assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 2);
+});
+
+test("replacement sessions retain ticket and dependency identities", async t => {
+  const f = await fixture(t);
+  move(f, "to-tickets"); await f.send(delegation()); await f.tick();
+  const children = ["first", "second"].map(key => ({ key, title: key, description: key, acceptanceCriteria: ["works"], blockedBy: key === "second" ? ["first"] : [] }));
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  const ids = f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate")).map(w => w.variables.input.id);
+  const relationId = f.relations[0].id;
+  await f.send({ ...delegation("replacement"), agentSession: { id: "replacement", issue: { id: "issue-1" } } });
+  await f.restart(); await f.tick(16);
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  assert.deepEqual(f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate")).map(w => w.variables.input.id), ids);
+  assert.deepEqual(f.relations.map(r => r.id), [relationId]);
+  await f.send(followup("remove-inherited-dependency", "Remove the dependency", "replacement")); await f.tick();
+  children[1]!.blockedBy = [];
+  planningResult(f, { approved: true, children }); await f.tick(16);
+  assert.equal(f.relations.length, 0);
+});
+
+
+test("child revision preserves human edits made after the supplied context", async t => {
+  const f = await fixture(t);
+  move(f, "to-tickets"); await f.send(delegation()); await f.tick();
+  const child = { key: "stable", title: "Original scope", description: "Original description", acceptanceCriteria: ["works"], blockedBy: [] };
+  planningResult(f, { approved: true, children: [child] }); await f.tick(12);
+  const id = f.artifactWrites.find(w => w.query.includes("BridgeArtifactCreate")).variables.input.id;
+  await f.send(followup("revise-child", "Refine this child")); await f.tick();
+  f.issueOverrides[id].title = "Human corrected title";
+  f.issueOverrides[id].description = "Human corrected acceptance criteria";
+  await f.restart();
+  planningResult(f, { approved: true, children: [{ ...child, description: "Agent revision from stale context" }] }); await f.tick(12);
+  assert.equal(f.issueOverrides[id].title, "Human corrected title");
+  assert.equal(f.issueOverrides[id].description, "Human corrected acceptance criteria");
+  assert.ok(f.activities.some(a => a.content.type === "error" && /changed|context/.test(a.content.body)));
+  await f.send(followup("reconcile-human-edit", "Revise using my correction")); await f.tick();
+  const turn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  assert.match(turn.message.text, /Human corrected acceptance criteria/);
+  planningResult(f, { approved: true, children: [{ ...child, title: "Human corrected title", description: "Agreed revision after correction" }] }); await f.tick(12);
+  assert.match(f.issueOverrides[id].description, /Agreed revision after correction/);
+});
+
+test("ticket keys matching object properties receive stable UUID identities", async t => {
+  const f = await fixture(t);
+  move(f, "to-tickets"); await f.send(delegation()); await f.tick();
+  const children = ["constructor", "__proto__", "toString"].map(key => ({ key, title: key, description: `Scope for ${key}`, acceptanceCriteria: ["works"], blockedBy: key === "__proto__" ? ["constructor"] : [] }));
+  planningResult(f, { approved: true, children }); await f.tick(20);
+  const created = f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate"));
+  assert.equal(created.length, 3);
+  for (const write of created) assert.match(write.variables.input.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(f.relations.length, 1);
+  await f.restart(); await f.send(followup("repeat-reserved-keys", "Keep the same scopes")); await f.tick();
+  planningResult(f, { approved: true, children }); await f.tick(20);
+  assert.equal(f.artifactWrites.filter(w => w.query.includes("BridgeArtifactCreate")).length, 3);
 });

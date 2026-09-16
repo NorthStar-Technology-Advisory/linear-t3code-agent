@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ArtifactOutput } from "./delivery.js";
-import type { IssueContext, LinearClient } from "./linear-context.js";
+import type { IssueContext, IssueRevision, LinearClient } from "./linear-context.js";
 import { IntegrationError } from "./t3code-runner.js";
 
 type Child = { id: string; title: string; description: string | null; parent: { id: string } | null; state: { type: string }; delegate: { id: string } | null };
@@ -35,7 +35,7 @@ async function blockingRelations(linear: LinearClient, id: string): Promise<Bloc
 const unstarted = (child: Child) => ["backlog", "unstarted", "triage"].includes(child.state.type) && !child.delegate;
 
 /** Prepare identities before any remote write. The coordinator durably stores this plan. */
-export async function preparePublication(linear: LinearClient, issue: IssueContext, stageId: string, artifacts: ArtifactOutput | undefined, summary: string, report: string, previous: ArtifactIdentities): Promise<{ publication: Publication; identities: ArtifactIdentities }> {
+export async function preparePublication(linear: LinearClient, issue: IssueContext, stageId: string, artifacts: ArtifactOutput | undefined, summary: string, report: string, previous: ArtifactIdentities, issueRevisions: Record<string, IssueRevision> | undefined): Promise<{ publication: Publication; identities: ArtifactIdentities }> {
   const parent = issue.parent ? await linear.issue(issue.parent.id) : issue;
   const identities: ArtifactIdentities = structuredClone(previous);
   const operations: Mutation[] = [];
@@ -49,9 +49,11 @@ export async function preparePublication(linear: LinearClient, issue: IssueConte
     for (const blocker of children.find(child => child.key === key)?.blockedBy ?? []) visit(blocker, next);
   };
   for (const child of children) visit(child.key, new Set());
-  for (const child of children) identities.children[child.key] ??= randomUUID();
   for (const child of children) {
-    if (child.blockedBy.some(key => key === child.key || !identities.children[key])) throw new IntegrationError(`Invalid dependency for ticket ${child.key}; use another retained ticket key.`, false);
+    if (!Object.hasOwn(identities.children, child.key)) Object.defineProperty(identities.children, child.key, { value: randomUUID(), enumerable: true, writable: true, configurable: true });
+  }
+  for (const child of children) {
+    if (child.blockedBy.some(key => key === child.key || !Object.hasOwn(identities.children, key))) throw new IntegrationError(`Invalid dependency for ticket ${child.key}; use another retained ticket key.`, false);
     const id = identities.children[child.key]!;
     const existing = await existingChild(linear, id);
     const description = `${child.description}\n\n## Acceptance criteria\n${child.acceptanceCriteria.map(c => `- ${c}`).join("\n")}\n\nSource specification: ${parent.url}\nBridge ticket key: ${child.key}`;
@@ -59,7 +61,9 @@ export async function preparePublication(linear: LinearClient, issue: IssueConte
       review.push(`${id} (${child.key}) is active, completed, delegated or no longer linked to this parent. Proposed scope: ${child.title}\n${description}\nProposed dependencies: ${child.blockedBy.join(", ") || "none"}. Human review required; commitments preserved.`);
       continue;
     }
-    operations.push({ kind: "child", id, parentId: parent.id, teamId: parent.team.id, projectId: parent.project?.id, title: child.title, description, ...(existing ? { before: { title: existing.title, description: existing.description } } : {}) });
+    const before = issueRevisions && Object.hasOwn(issueRevisions, id) ? issueRevisions[id] : undefined;
+    if (existing && (!before || existing.title !== before.title || existing.description !== before.description)) throw new IntegrationError(`Child ${id} changed since the context supplied to this turn, or its original context is unavailable. Preserve the human edits and send revision feedback to refresh context.`, false);
+    operations.push({ kind: "child", id, parentId: parent.id, teamId: parent.team.id, projectId: parent.project?.id, title: child.title, description, ...(before ? { before } : {}) });
     for (const [key, relationId] of Object.entries(previous.relations)) {
       const separator = key.indexOf(":");
       if (key.slice(separator + 1) === child.key && !child.blockedBy.includes(key.slice(0, separator))) {
@@ -71,7 +75,7 @@ export async function preparePublication(linear: LinearClient, issue: IssueConte
       const key = `${blocker}:${child.key}`;
       const matches = currentRelations.filter(r => r.type === "blocks" && r.issue.id === identities.children[blocker]);
       if (matches.length > 1) throw new IntegrationError(`Ambiguous duplicate dependencies for ${child.key}; reconcile them in Linear before resuming.`, false);
-      const relationId = identities.relations[key] = matches[0]?.id ?? identities.relations[key] ?? randomUUID();
+      const relationId = identities.relations[key] = matches[0]?.id ?? (Object.hasOwn(identities.relations, key) ? identities.relations[key] : randomUUID());
       operations.push({ kind: "relation", id: relationId, issueId: identities.children[blocker]!, relatedIssueId: id });
     }
   }

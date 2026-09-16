@@ -1,5 +1,11 @@
 # Changelog
 
+## NOR-197 — artifact review fixes
+
+- Carry child and dependency identities into replacement sessions after provider stop.
+- Check child revisions against the context captured before the agent turn, preserving intervening human edits across restart.
+- Allocate ticket identities using own-property checks, including keys such as `constructor` and `__proto__`.
+
 ## NOR-197 — review fixes
 
 - Resolve the current issue session from Linear's session chronology, stop superseded providers before replacement work, and reject stale session follow-ups.

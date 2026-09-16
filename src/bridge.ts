@@ -6,7 +6,7 @@ import { writeFile, realpath } from "node:fs/promises";
 import { z } from "zod";
 import { BridgeStore } from "./bridge-store.js";
 import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
-import { LinearClient } from "./linear-context.js";
+import { LinearClient, type IssueRevision } from "./linear-context.js";
 import { prepareCheckout, git, type Route } from "./repository.js";
 import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
@@ -37,7 +37,7 @@ type Session = {
   pr?: PullRequest; lastPrCheckAt?: number; cleanup?: string;
   requests: PendingRequest[]; responses: RunnerCommand[];
   generation: number; cancelHadActive?: boolean; cancelCommand?: RunnerCommand; interrupted?: boolean; stopSent?: boolean;
-  created: boolean; workspaceRequested?: boolean; bootstrapRecoveryPending?: boolean; active?: { messageId: string; turnId?: string; previousTurnId?: string };
+  created: boolean; workspaceRequested?: boolean; bootstrapRecoveryPending?: boolean; active?: { issueRevisions?: Record<string, IssueRevision>; messageId: string; turnId?: string; previousTurnId?: string };
   sequence: number; seenActivities: string[]; createdAt: string; updatedAt: string;
   lastReportAt: number; lastError?: string; contextFingerprint?: string;
 };
@@ -434,6 +434,16 @@ export class Bridge {
     });
     if (owner !== id || !stillCurrent()) return;
     if (Object.values(this.store.read().sessions).some(other => other.issueId === session.issueId && other.supersededBy && other.status !== "closed")) return;
+    if (!session.artifacts) {
+      // Ownership is settled and all predecessors have stopped before copying their ledger.
+      this.store.update(state => {
+        const predecessor = Object.values(state.sessions)
+          .filter(other => other.id !== id && other.issueId === session.issueId && other.artifacts)
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        state.sessions[id].artifacts = structuredClone(predecessor?.artifacts ?? { children: {}, relations: {} });
+      });
+      session = this.session(id);
+    }
     const gateIssue = await this.options.linear.issue(session.issueId);
     if (!stillCurrent()) return;
     const gate = workflowGate(gateIssue);
@@ -619,7 +629,7 @@ export class Bridge {
             const issue = await this.options.linear.issue(session.issueId);
             let prepared: Awaited<ReturnType<typeof preparePublication>>;
             try {
-              prepared = await preparePublication(this.options.linear, issue, session.stage!.id, result.artifacts, result.summary!, result.body, session.artifacts ?? { children: {}, relations: {} });
+              prepared = await preparePublication(this.options.linear, issue, session.stage!.id, result.artifacts, result.summary!, result.body, session.artifacts ?? { children: {}, relations: {} }, session.active.issueRevisions);
             } catch (error) {
               if (!stillCurrent()) return;
               if (error instanceof IntegrationError && !error.retryable) this.store.update(s => {
@@ -702,7 +712,7 @@ export class Bridge {
         current.contextFingerprint = context.fingerprint;
         current.command = command;
         if (command.bootstrap) current.workspaceRequested = true;
-        current.active = { messageId: turn.id, previousTurnId: snapshot.thread.latestTurn?.turnId };
+        current.active = { issueRevisions: context.issueRevisions, messageId: turn.id, previousTurnId: snapshot.thread.latestTurn?.turnId };
         current.queue.shift();
       });
       await this.options.runner.dispatch(command);
