@@ -134,7 +134,7 @@ When upgrading from labels/markers, add project YAML and restart the bridge on t
 
 ### Artifacts and revisions
 
-The parent description is the authoritative brief/specification. Parent comments retain grilling discussions and revision summaries. Children contain scope, acceptance criteria and a source-spec link; no duplicate full specification is needed. Planning requires no code changes, validation command, PR, repository Markdown, GitHub tickets or separate Linear document.
+The parent description is the authoritative brief/specification. Questions and replies stay in the Agent Session sidebar and T3Code conversation. Published specifications and tickets provide the handoff to fresh threads; the bridge does not copy the Q&A transcript into them. Parent comments contain deliberate published summaries and revision notes, not a copy of every question. Children contain scope, acceptance criteria and a source-spec link; no duplicate full specification is needed. Planning requires no code changes, validation command, PR, repository Markdown, GitHub tickets or separate Linear document.
 
 The installed skill returns structured publication content to the bridge after any required human review. The bridge publishes it with durable operation and child identities, verifies/reconciles writes, then reports completion. Child creation does not delegate work. Stable child keys are reused on re-entry and replacement delegation. After predecessor execution has stopped, the replacement inherits its child/dependency identity ledger before collecting context. Keys such as `constructor` and `__proto__` are treated as ordinary own keys. Unstarted children and their blocking links are reconciled; active, completed or delegated children retain their commitments and get proposed changes reported for human review. Omitted children are preserved and identified as possibly stale.
 
@@ -168,15 +168,9 @@ Responses remain pending until T3Code reports resolution. A provider response fa
 
 Ordinary follow-ups run in arrival order. A failed or incomplete turn pauses the queue; send `resume` to continue or `cancel` to clear it. Fix configuration/access first if that was the blocker. Paused active turns are still observed so completed remote work releases capacity, while their follow-up queue remains paused. A later prompt can resume a cancelled **worktree** session while its PR remains open. In **current-checkout** mode, cancellation ends the session permanently after the provider stops, releases its reservation even when no PR exists, and preserves files, branch and any PR. Further work requires a new delegation; `resume` cannot reopen that ended session. `MAX_CONCURRENT_SESSIONS` limits active sessions, including sessions waiting for an answer or for cancellation to finish.
 
-Questions and approvals appear in Linear with request IDs:
+Questions appear as readable Markdown in the Linear Agent Session sidebar, with numbered questions and lettered choices. Reply in your own words, with a question/choice pair such as `1A` or `2B`, or just `A` for the current question. For multiple selections, use comma-separated choices such as `2A, 2C`. A choice for a different question is rejected rather than applied to the current question. If T3Code asks several questions together, the bridge collects answers one at a time and sends the complete response; partial answers survive restarts. While a question is pending, ordinary replies answer that question. Once submitted, additional replies receive a waiting notice and are not submitted as another answer. Questions and replies are not mirrored into issue comments. Deliberate workflow publications (summaries, specifications and tickets) retain their configured destinations.
 
-```text
-approve <request-id>
-decline <request-id>
-answer <request-id> {"question-id":"answer"}
-```
-
-Only explicit approval commands grant approval. Other messages stay queued. `stop`, `cancel`, and Linear's actual stop signal interrupt execution and stop the provider session, clear pending work, and preserve the thread, branch, worktree, edits and PR. New work waits until provider stop is observed. If T3Code reports a stop failure, repair the provider and send `cancel` to retry; the bridge retains the execution slot until stop is confirmed. Execution and human answers have **no bridge deadline**. Thirty-second network/git operation limits only bound individual connection attempts.
+Approvals still require `approve <request-id>` or `decline <request-id>` as shown in the sidebar; an ordinary “yes” never grants approval. The legacy `answer <request-id> {"question-id":"answer"}` format remains supported. With no pending question, ordinary follow-ups stay queued. `stop`, `cancel`, and Linear's actual stop signal interrupt execution and stop the provider session, clear pending work, and preserve the thread, branch, worktree, edits and PR. New work waits until provider stop is observed. If T3Code reports a stop failure, repair the provider and send `cancel` to retry; the bridge retains the execution slot until stop is confirmed. Execution and human answers have **no bridge deadline**. Thirty-second network/git operation limits only bound individual connection attempts.
 
 ## Context and delivery
 

@@ -1,3 +1,4 @@
+import { Questions, nextQuestion, questionText, naturalAnswer, type Question, type Answers } from "./questions.js";
 import { matchProject } from "./project-routing.js";
 import { preparePublication, publishNext, type Publication, type ArtifactIdentities } from "./artifacts.js";
 import { selectStatus, workflowGate, type Stage } from "./workflow.js";
@@ -22,11 +23,11 @@ const WebhookSchema = z.object({
 });
 type Webhook = z.infer<typeof WebhookSchema>;
 type QueuedTurn = { id: string; body: string };
-type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
+type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Question[]; partialAnswers?: Answers; questionNumber?: number; };
 type SavedThread = { threadId: string; created: boolean; sequence: number; seenActivities: string[] };
 type Session = {
   id: string; workspaceId: string; issueId: string; teamId?: string; supersededBy?: string;
-  artifactParentId?: string;
+  artifactParentId?: string; questionCount?: number;
   publicationPreparationBlocked?: boolean;
   publication?: Publication; publicationHistory?: Publication[]; artifacts?: ArtifactIdentities;
   stage?: Stage; previousThreads?: SavedThread[];
@@ -139,7 +140,8 @@ export class Bridge {
         return;
       }
       const reply = payload.agentActivity?.content?.body?.trim() ?? "";
-      const match = /^(approve|decline|answer)\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(reply);
+      const explicit = /^(approve|decline|answer)\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(reply);
+      const match = explicit && (explicit[1].toLowerCase() !== "answer" || session.requests.some(r => r.id === explicit[2]) || explicit[3]?.startsWith("{")) ? explicit : null;
       if (match) {
         const request = session.requests.find(r => r.id === match[2]);
         if (!request) {
@@ -166,7 +168,30 @@ export class Bridge {
         if ((!request.response || request.responseUnconfirmed) && !session.responses.some(r => r.requestId === request.id)) {
           request.responseUnconfirmed = false;
           session.responses.push(command);
-          this.discussion(state, session, `Human response to ${request.id}:\n${reply}`);
+        }
+        return;
+      }
+      const pendingQuestion = session.requests.find(r => r.kind === "question" && nextQuestion(r));
+      if (reply && pendingQuestion) {
+        if ((pendingQuestion.response && !pendingQuestion.responseUnconfirmed) || session.responses.some(r => r.requestId === pendingQuestion.id)) {
+          this.report(state, session, "thought", "Your answer has already been submitted. Waiting for the agent to continue.");
+          return;
+        }
+        const question = nextQuestion(pendingQuestion)!;
+        const answer = naturalAnswer(pendingQuestion, reply);
+        if (answer === undefined) {
+          this.report(state, session, "elicitation", `That choice does not match the current question.\n\n${questionText(pendingQuestion)}`);
+          return;
+        }
+        pendingQuestion.partialAnswers = { ...pendingQuestion.partialAnswers, [question.id]: answer };
+        if (nextQuestion(pendingQuestion)) {
+          this.report(state, session, "elicitation", questionText(pendingQuestion));
+        } else {
+          const answers = pendingQuestion.partialAnswers;
+          delete pendingQuestion.partialAnswers;
+          pendingQuestion.responseUnconfirmed = false;
+          session.responses.push({ type: "thread.user-input.respond", commandId: randomUUID(), threadId: session.threadId,
+            requestId: pendingQuestion.id, answers, createdAt: new Date().toISOString() });
         }
         return;
       }
@@ -185,11 +210,7 @@ export class Bridge {
   private prompt(payload: Webhook) {
     return [payload.agentActivity?.content?.body, payload.promptContext, ...(payload.guidance ?? []).map(g => g.body)].filter(Boolean).join("\n\n");
   }
-  private discussion(state: State, session: Session, body: string) {
-    if (session.stage && session.stage.output !== "draft-pr") state.outbox.push({ id: randomUUID(), sessionId: session.id, issueId: session.artifactParentId ?? session.issueId, type: "thought", body: redact(body) });
-  }
   private report(state: State, session: Session, type: Outbound["type"], body: string) {
-    if (type === "elicitation") this.discussion(state, session, body);
     const clean = redact(body);
     const chunks = clean.match(/[\s\S]{1,8000}/gu) ?? [""];
     for (let i = 0; i < chunks.length; i++) state.outbox.push({ id: randomUUID(), sessionId: session.id,
@@ -288,6 +309,18 @@ export class Bridge {
   private observe(id: string, thread: RunnerThread, sequence: number, reconciled = false) {
     this.store.update(state => {
       const session = state.sessions[id];
+      const reformatted = new Set<string>();
+      // Upgrade saved pending questions from the earlier raw-JSON presentation.
+      for (const request of session.requests) {
+        if (request.kind !== "question" || request.questionNumber !== undefined) continue;
+        try {
+          const questions = Questions.safeParse(JSON.parse(request.description).questions);
+          if (questions.success) request.questions = questions.data;
+        } catch { /* A readable description needs no payload migration. */ }
+        request.questionNumber = (session.questionCount ?? 0) + 1;
+        session.questionCount = request.questionNumber + (request.questions?.length ?? 1) - 1;
+        reformatted.add(request.id);
+      }
       const previousRequests = new Map(session.requests.map(r => [r.id, r]));
       if (reconciled) session.requests = [];
       const newActivities = thread.activities.filter(a => !session.seenActivities.includes(a.id));
@@ -299,10 +332,15 @@ export class Bridge {
           session.requests = session.requests.filter(r => r.id !== requestId);
         }
         if (typeof requestId === "string" && /^(approval|user-input)\.requested$/.test(activity.kind)) {
-          const questions = z.array(z.object({ id: z.string(), question: z.string(), multiSelect: z.boolean().optional() })).safeParse(activity.payload?.questions);
+          const questions = Questions.safeParse(activity.payload?.questions);
+          let questionNumber = previousRequests.get(requestId)?.questionNumber;
+          if (questionNumber === undefined && questions.success) {
+            questionNumber = (session.questionCount ?? 0) + 1;
+            session.questionCount = questionNumber + questions.data.length - 1;
+          }
           const request: PendingRequest = {
-            id: requestId, kind: activity.kind === "approval.requested" ? "approval" : "question",
-            description: JSON.stringify(activity.payload, null, 2), response: previousRequests.get(requestId)?.response, responseUnconfirmed: previousRequests.get(requestId)?.responseUnconfirmed, responseMode: typeof activity.payload?.responseMode === "string" ? activity.payload.responseMode : undefined, questions: questions.success ? questions.data : undefined,
+            questionNumber, id: requestId, kind: activity.kind === "approval.requested" ? "approval" : "question",
+            description: typeof activity.payload?.detail === "string" ? activity.payload.detail : activity.summary, partialAnswers: previousRequests.get(requestId)?.partialAnswers, response: previousRequests.get(requestId)?.response, responseUnconfirmed: previousRequests.get(requestId)?.responseUnconfirmed, responseMode: typeof activity.payload?.responseMode === "string" ? activity.payload.responseMode : undefined, questions: questions.success ? questions.data : undefined,
           };
           session.requests = session.requests.filter(r => r.id !== request.id);
           session.requests.push(request);
@@ -314,22 +352,23 @@ export class Bridge {
         if (!request) continue;
         delete request.response; delete request.responseUnconfirmed;
         session.responses = session.responses.filter(r => r.requestId !== request.id);
-        this.report(state, session, "elicitation", `T3Code provider response failed for request ${request.id}. The request remains pending. Check T3Code, then send a corrected explicit answer or approval; unrelated prompts remain queued.`);
+        this.report(state, session, "elicitation", request.kind === "question" ? `T3Code could not accept your answer. Please reply again.\n\n${questionText(request)}` : `T3Code provider response failed for request ${request.id}. The request remains pending. Check T3Code, then send a corrected explicit answer or approval; unrelated prompts remain queued.`);
       }
       if (reconciled) {
         for (const request of session.requests) {
           if (!request.response || request.responseUnconfirmed || session.responses.some(r => r.requestId === request.id)) continue;
           request.responseUnconfirmed = true;
-          this.report(state, session, "elicitation", `T3Code still lists request ${request.id} as pending after a gap in event history. The prior response outcome is unknown. No response was resent. Inspect the request, then send a new explicit answer or approval if it should be retried.`);
+          this.report(state, session, "elicitation", request.kind === "question" ? `T3Code still needs an answer after reconnecting; the previous response could not be confirmed. Please reply again if you want to retry.\n\n${questionText(request)}` : `T3Code still lists request ${request.id} as pending after a gap in event history. The prior response outcome is unknown. No response was resent. Inspect the request, then send a new explicit answer or approval if it should be retried.`);
         }
       }
       // Only elicit requests still pending after replaying the whole snapshot.
       for (const request of session.requests) {
-        if (!(reconciled && !previousRequests.has(request.id)) && !newActivities.some(a => a.payload?.requestId === request.id && a.kind.endsWith(".requested"))) continue;
-        const instruction = request.kind === "approval"
-          ? `Reply exactly: approve ${request.id} OR decline ${request.id}.`
-          : `Reply: answer ${request.id} followed by a JSON object mapping each question ID to its answer.`;
-        this.report(state, session, "elicitation", `${request.description}\n\n${instruction}\nOther follow-ups stay queued. There is no response deadline.`);
+        const becameCurrent = request.kind === "question" && session.requests.find(r => r.kind === "question")?.id === request.id
+          && [...previousRequests.values()].find(r => r.kind === "question")?.id !== request.id;
+        if (!becameCurrent && !reformatted.has(request.id) && !(reconciled && !previousRequests.has(request.id)) && !newActivities.some(a => a.payload?.requestId === request.id && a.kind.endsWith(".requested"))) continue;
+        if (request.kind === "question") {
+          if (session.requests.find(r => r.kind === "question")?.id === request.id) this.report(state, session, "elicitation", questionText(request));
+        } else this.report(state, session, "elicitation", `${request.description}\n\nReply exactly: approve ${request.id} OR decline ${request.id}.`);
       }
       const progress = newActivities.filter(a => !/^(approval|user-input)\./.test(a.kind));
       if (progress.length) session.pendingProgress = progress.at(-1)!.summary;
@@ -441,6 +480,7 @@ export class Bridge {
           .filter(other => other.id !== id && other.issueId === session.issueId && other.artifacts)
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
         state.sessions[id].artifacts = structuredClone(predecessor?.artifacts ?? { children: {}, relations: {} });
+        state.sessions[id].questionCount = predecessor?.questionCount ?? 0;
       });
       session = this.session(id);
     }
@@ -545,7 +585,7 @@ export class Bridge {
       if (!stillCurrent()) return;
       const command: RunnerCommand = session.command ?? {
         type: "thread.create", commandId: randomUUID(), threadId: session.threadId,
-        projectId: session.route!.t3ProjectId, title: `Linear ${session.issueId}`,
+        projectId: session.route!.t3ProjectId, title: gateIssue.title,
         modelSelection: session.route!.modelSelection,
         runtimeMode: "full-access", interactionMode: "default", branch: session.branch,
         worktreePath: session.worktree, createdAt: session.createdAt,
@@ -591,7 +631,7 @@ export class Bridge {
           s.sessions[id].responses.shift();
           const request = s.sessions[id].requests.find(r => r.id === response.requestId);
           if (request?.response) request.responseUnconfirmed = true;
-          this.report(s, s.sessions[id], "elicitation", `T3Code rejected the response for ${String(response.requestId)}. Check the request and credentials, then send a corrected explicit response. No replacement was submitted automatically.`);
+          this.report(s, s.sessions[id], "elicitation", request?.kind === "question" ? `T3Code rejected your answer. Check the request and reply again; no replacement was submitted automatically.\n\n${questionText(request)}` : `T3Code rejected the response for ${String(response.requestId)}. Check the request and credentials, then send a corrected explicit response. No replacement was submitted automatically.`);
         });
         return;
       }
