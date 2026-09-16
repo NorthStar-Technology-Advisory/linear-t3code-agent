@@ -8,7 +8,7 @@ import { z } from "zod";
 import { BridgeStore } from "./bridge-store.js";
 import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient, type IssueRevision } from "./linear-context.js";
-import { prepareCheckout, git, type Route } from "./repository.js";
+import { prepareCheckout, ticketBranch, git, type Route } from "./repository.js";
 import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
@@ -107,7 +107,7 @@ export class Bridge {
       }
       if (session.workspaceId !== payload.organizationId) throw new Error("Workspace does not match the existing session.");
       if (session.status === "closed") {
-        this.report(state, session, "error", "This session has ended. Start a new delegation for further implementation; resume cannot reopen it.");
+        this.report(state, session, "error", "This session has ended; resume cannot reopen it. If its PR closed or merged, create a new Linear ticket for further implementation.");
         return;
       }
       const body = payload.agentActivity?.content?.body?.trim().toLowerCase();
@@ -281,7 +281,7 @@ export class Bridge {
     if (this.session(session.id).generation !== session.generation) return true;
     this.store.update(s => {
       const current = s.sessions[session.id]; current.status = "closed"; current.queue = []; current.cleanup = cleanup;
-      this.report(s, current, "error", `PR ${pr.url} is ${pr.state.toLowerCase()}. Start a new delegation for further implementation.\n${cleanup}`);
+      this.report(s, current, "error", `PR ${pr.url} is ${pr.state.toLowerCase()}. Create a new Linear ticket for further implementation.\n${cleanup}`);
     });
     return true;
   }
@@ -472,21 +472,49 @@ export class Bridge {
     if (session.stage && !session.stage.output) throw new IntegrationError("This session uses the previous workflow configuration. Cancel it and start a new delegation after adding project YAML.", false);
 
     if (!session.route) {
+      // Session history is the durable ticket-workspace ledger. Only transfer it
+      // after every previous provider has stopped (the ownership gate above).
+      let predecessor = Object.values(this.store.read().sessions).reverse()
+        .filter(other => other.id !== id && other.workspaceId === session.workspaceId && other.issueId === session.issueId && other.route)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (predecessor) {
+        if (predecessor.cleanup || (predecessor.pr && predecessor.pr.state !== "OPEN")) throw new IntegrationError("This ticket's PR has closed or merged. Its workspace is retired; create a new Linear ticket for further work.", false);
+        if (predecessor.route!.workspaceMode !== "worktree") throw new IntegrationError("This ticket uses a legacy current checkout. Preserve its changes and finish it before starting a new ticket with an isolated worktree.", false);
+        if (predecessor.workspaceRequested && !predecessor.worktree) {
+          const snapshot = await this.options.runner.snapshot(predecessor.threadId);
+          if (snapshot) predecessor = await this.reconcileWorkspace(predecessor, snapshot.thread);
+        }
+        if (predecessor.workspaceRequested && !predecessor.worktree) throw new IntegrationError("The previous session requested a worktree but its path is unverified. Reconcile its T3Code workspace before retrying; no replacement workspace was created.", false);
+        if (predecessor.worktree) {
+          let root: string;
+          try { root = await realpath(predecessor.worktree); }
+          catch { throw new IntegrationError("The ticket worktree is missing. Restore it before resuming; no replacement workspace was created.", false); }
+          const entries = (await git(predecessor.route!.repository, "worktree", "list", "--porcelain")).split("\n\n");
+          if (!entries.some(entry => entry.split("\n").includes(`worktree ${root}`) && entry.split("\n").includes(`branch refs/heads/${predecessor.branch}`))) throw new IntegrationError("The ticket worktree is missing or its branch changed. Restore it before resuming.", false);
+        }
+        if (!stillCurrent()) return;
+        this.store.update(s => Object.assign(s.sessions[id], {
+          route: structuredClone(predecessor.route), branch: predecessor.branch,
+          worktree: predecessor.worktree, pr: predecessor.pr, teamId: gateIssue.team.id,
+          bootstrapRecoveryPending: predecessor.bootstrapRecoveryPending,
+        }));
+        session = this.session(id);
+      }
+    }
+    if (!session.route) {
       let route: Route;
       try {
         const title = projectConfig!.project;
-        const project = matchProject(await this.options.runner.projects(), title);
+        const project = await matchProject(await this.options.runner.projects(), title);
         const execution = await this.options.runner.execution(project);
-        route = { repository: execution.workspaceMode === "local" ? await realpath(project.workspaceRoot) : project.workspaceRoot, t3ProjectId: project.id, ...execution, baseBranch: "" };
+        route = { repository: await realpath(project.workspaceRoot), t3ProjectId: project.id, ...execution, workspaceMode: "worktree", baseBranch: "" };
         if (route.workspaceMode === "worktree") route.baseBranch = await this.options.runner.baseBranch(route.repository);
       } catch (error) { throw new IntegrationError(error instanceof Error ? error.message : "Project resolution failed; correct T3Code settings and send resume.", false); }
+      const branch = ticketBranch(gateIssue.identifier, gateIssue.title);
+      if (await git(route.repository, "for-each-ref", "--format=%(refname)", `refs/heads/${branch}`)) throw new IntegrationError(`Branch ${branch} already exists without a saved ticket workspace. Reconcile the existing branch before resuming; files were preserved.`, false);
       if (!stillCurrent()) return;
       this.store.update(s => {
-        if (route.workspaceMode === "local") {
-          const occupant = Object.values(s.sessions).find(other => other.id !== id && other.route?.workspaceMode === "local" && other.route.repository === route.repository && other.status !== "closed");
-          if (occupant) throw new IntegrationError(`Checkout ${route.repository} is reserved by Linear session ${occupant.id}. After that session ends through PR closure or cancel, send resume here.`, false);
-          s.sessions[id].worktree = null;
-        }
+        s.sessions[id].branch = branch;
         s.sessions[id].route = route; s.sessions[id].teamId = gateIssue.team.id;
       });
       session = this.session(id);
