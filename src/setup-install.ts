@@ -1,6 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 
@@ -12,11 +10,6 @@ async function installed(file: string): Promise<string | undefined> {
     const result = installation.safeParse(store.installations?.[id]);
     if (result.success && result.data.expires_at > Date.now()) return result.data.access_token;
   } catch { /* Missing or incomplete installation; the callback writes it atomically. */ }
-}
-
-async function openBrowser(url: string) {
-  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
-  await promisify(execFile)(command, process.platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url], { timeout: 10000 });
 }
 
 /** Setup owns interaction; the running bridge owns OAuth state and token writes. */
@@ -74,15 +67,11 @@ export async function installLinear(
       return false;
     }
     console.log(`Check the existing Linear app uses these URLs:\nRedirect URI: ${values.LINEAR_REDIRECT_URI}\nWebhook URL: ${new URL("/linear/webhook", values.BASE_URL).href}`);
-    if (!args.includes("--no-browser")) {
-      try {
-        await openBrowser(authorization.href);
-        console.log("Opened Linear in your browser. Choose your workspace and approve access for the app.");
-      } catch {
-        console.log(`Could not open a browser. Open this Linear authorization link manually:\n${authorization.href}`);
-      }
-    } else console.log(`Open this Linear authorization link manually:\n${authorization.href}`);
-    console.log("Waiting for Linear installation. Setup continues automatically after approval. If the browser reports an error or the link expires, fix it and press Enter to open a fresh link. Ctrl+C safely exits.");
+    console.log("Choose your workspace and approve the app using this link:");
+    if (process.stdout.isTTY) console.log(`\u001b]8;;${authorization.href}\u0007Authorize T3Code in Linear\u001b]8;;\u0007`);
+    // Always include the full URL for terminals that auto-link URLs or lack OSC 8 support.
+    console.log(authorization.href);
+    console.log("Waiting for Linear installation. Setup continues automatically after approval. If the browser reports an error or the link expires, fix it and press Enter to generate a fresh link. Ctrl+C safely exits.");
     // Keep one pending stdin read while polling; never accumulate abandoned reads.
     const input = nextLine();
     while (true) {
