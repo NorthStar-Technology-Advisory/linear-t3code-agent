@@ -1,0 +1,54 @@
+t3code:
+  version: 1
+  project: "Zenith" # Exact title of the active project in T3Code.
+
+  instructions: |
+    Work from the current Linear issue and its linked context.
+    Preserve agreed decisions and explain any blockers clearly.
+    Ask for clarification when required information is missing.
+
+  workflows:
+    - team: "NOR"
+      statuses:
+        "Ready for grilling":
+          output: comment
+          required-skills:
+            - grill-me
+          prompt: |
+            Use $grill-me to challenge this issue's requirements.
+            Read the issue and existing discussion first.
+            Ask questions to resolve ambiguity and record the agreed
+            decisions, assumptions and remaining uncertainties.
+
+        "Ready for specification":
+          output: specification
+          required-skills:
+            - to-spec
+          prompt: |
+            Use $to-spec to turn the agreed requirements into a
+            reviewable specification in the parent issue description.
+            Preserve the original problem and incorporate decisions
+            from the discussion. Include observable acceptance criteria.
+
+        "Ready for tickets":
+          output: tickets
+          required-skills:
+            - to-tickets
+          prompt: |
+            Use $to-tickets to break the reviewed specification into
+            native Linear child issues with acceptance criteria and
+            blocking dependencies. Obtain the required human review.
+            On revision, reconcile the existing breakdown instead of
+            creating duplicate tickets. Do not delegate the children.
+
+        "Ready for implementation":
+          new-thread: true
+          output: draft-pr
+          required-skills:
+            - implement
+          prompt: |
+            Use $implement to implement this issue.
+            Read the parent specification, decisions and dependencies.
+            Make the changes, run appropriate checks and open a draft
+            pull request. Report validation results and any blockers.
+            Follow-up feedback should update the same pull request.

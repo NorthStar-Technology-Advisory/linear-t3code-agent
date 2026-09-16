@@ -82,7 +82,7 @@ async function setup() {
     await ask("LINEAR_CLIENT_ID", "Linear application Client ID");
     await ask("LINEAR_CLIENT_SECRET", "Linear Client secret (hidden)", true);
     await ask("LINEAR_WEBHOOK_SECRET", "Linear webhook signing secret (hidden)", true);
-    console.log('In Linear Settings → Projects → Labels, create one "T3Code project" group. Select one child on your Linear project with the exact active T3Code project title. No UUID mapping is needed.');
+    console.log('Add a t3code YAML code block to your Linear project detailed description (see README → Project configuration). Set project to the exact active T3Code project title and map your team status names to prompts and outputs. No UUID mapping is needed.');
     await ask("SETUP_ISSUE", "An existing issue identifier in that project (read-only check; no delegation)");
     console.log("Configuration saved privately. Run npm run build, then npm start in another terminal. Complete the existing app-actor OAuth installation using /linear/install and your saved INSTALL_SECRET (see docs/operations.md). Rerun setup after installation. No coding task is needed.");
   } finally { rl.close(); }

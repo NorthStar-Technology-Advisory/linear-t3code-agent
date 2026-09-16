@@ -1,6 +1,6 @@
 import { matchProject } from "./project-routing.js";
 import { preparePublication, publishNext, type Publication, type ArtifactIdentities } from "./artifacts.js";
-import { selectWorkflow, workflowGate, type Stage } from "./workflow.js";
+import { selectStatus, workflowGate, type Stage } from "./workflow.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { writeFile, realpath } from "node:fs/promises";
@@ -29,7 +29,7 @@ type Session = {
   artifactParentId?: string;
   publicationPreparationBlocked?: boolean;
   publication?: Publication; publicationHistory?: Publication[]; artifacts?: ArtifactIdentities;
-  stage?: Stage; previousWorkflow?: Stage["workflow"]; planningThread?: SavedThread; implementationThreads?: SavedThread[];
+  stage?: Stage; previousThreads?: SavedThread[];
   gate?: string; gateRevision?: number; gateDirty?: boolean; transition?: boolean; retiredRequests?: string[];
   threadId: string; branch: string; worktree: string | null; route?: Route;
   status: "queued" | "running" | "paused" | "cancelled" | "cancelling" | "idle" | "closed";
@@ -186,7 +186,7 @@ export class Bridge {
     return [payload.agentActivity?.content?.body, payload.promptContext, ...(payload.guidance ?? []).map(g => g.body)].filter(Boolean).join("\n\n");
   }
   private discussion(state: State, session: Session, body: string) {
-    if (session.stage && session.stage.workflow !== "implement") state.outbox.push({ id: randomUUID(), sessionId: session.id, issueId: session.artifactParentId ?? session.issueId, type: "thought", body: redact(body) });
+    if (session.stage && session.stage.output !== "draft-pr") state.outbox.push({ id: randomUUID(), sessionId: session.id, issueId: session.artifactParentId ?? session.issueId, type: "thought", body: redact(body) });
   }
   private report(state: State, session: Session, type: Outbound["type"], body: string) {
     if (type === "elicitation") this.discussion(state, session, body);
@@ -392,7 +392,6 @@ export class Bridge {
           current.seenActivities = [...new Set([...current.seenActivities, ...snapshot.thread.activities.map(a => a.id)])];
           current.retiredRequests = [...new Set([...(current.retiredRequests ?? []), ...snapshot.thread.activities.flatMap(a => typeof a.payload?.requestId === "string" ? [a.payload.requestId] : [])])];
         }
-        current.previousWorkflow = current.stage?.workflow ?? current.previousWorkflow;
         delete current.stage;
         current.status = "queued";
         current.queue = [{ id: randomUUID(), body: "Execute the stage selected by the current Linear status. Read refreshed artifacts and reconcile existing work before proceeding." }];
@@ -453,7 +452,6 @@ export class Bridge {
       this.store.update(s => {
         const current = s.sessions[id];
         current.gate = gate;
-        if (!current.stage && !current.previousWorkflow && current.created) current.previousWorkflow = "implement";
         this.requestCancellation(current);
         current.transition = true;
         s.outbox = s.outbox.filter(o => o.sessionId !== id || o.issueId);
@@ -461,18 +459,22 @@ export class Bridge {
       return;
     }
     this.store.update(s => { s.sessions[id].gate = gate; });
-    if (!gateIssue.delegated || (!session.stage && !selectWorkflow(gateIssue))) {
+    // Existing invocations retain their configuration; edits take effect on the next entry.
+    const projectConfig = gateIssue.delegated && !session.stage
+      ? await this.options.linear.projectConfig(gateIssue.project?.id) : undefined;
+    if (!stillCurrent()) return;
+    const selectedStatus = projectConfig ? selectStatus(gateIssue, projectConfig) : undefined;
+    if (!gateIssue.delegated || (!session.stage && !selectedStatus)) {
       this.store.update(s => { s.sessions[id].status = "idle"; s.sessions[id].queue = []; });
       return;
     }
     if (session.status !== "running" && !(session.status === "paused" && session.active)) return;
+    if (session.stage && !session.stage.output) throw new IntegrationError("This session uses the previous workflow configuration. Cancel it and start a new delegation after adding project YAML.", false);
 
     if (!session.route) {
-      const issue = await this.options.linear.issue(session.issueId);
-      if (!stillCurrent()) return;
       let route: Route;
       try {
-        const title = await this.options.linear.projectTitle(issue.project?.id);
+        const title = projectConfig!.project;
         const project = matchProject(await this.options.runner.projects(), title);
         const execution = await this.options.runner.execution(project);
         route = { repository: execution.workspaceMode === "local" ? await realpath(project.workspaceRoot) : project.workspaceRoot, t3ProjectId: project.id, ...execution, baseBranch: "" };
@@ -485,26 +487,26 @@ export class Bridge {
           if (occupant) throw new IntegrationError(`Checkout ${route.repository} is reserved by Linear session ${occupant.id}. After that session ends through PR closure or cancel, send resume here.`, false);
           s.sessions[id].worktree = null;
         }
-        s.sessions[id].route = route; s.sessions[id].teamId = issue.team.id;
+        s.sessions[id].route = route; s.sessions[id].teamId = gateIssue.team.id;
       });
       session = this.session(id);
     }
     if (!session.stage) {
-      const workflow = selectWorkflow(gateIssue)!;
-      const skillPath = await this.options.runner.skill(workflow, session.worktree ?? session.route!.repository, session.route!.modelSelection.instanceId);
+      const settings = selectedStatus!;
+      const skills: Stage["skills"] = [];
+      for (const name of settings["required-skills"]) {
+        skills.push({ name, path: await this.options.runner.skill(name, session.worktree ?? session.route!.repository, session.route!.modelSelection.instanceId) });
+      }
       if (!stillCurrent()) return;
       this.store.update(s => {
         const current = s.sessions[id];
-        const saved = { threadId: current.threadId, created: current.created, sequence: current.sequence, seenActivities: current.seenActivities };
-        if (current.previousWorkflow && current.previousWorkflow !== "implement") current.planningThread = saved;
-        if (workflow === "implement" && current.previousWorkflow && current.previousWorkflow !== "implement") {
+        if (settings["new-thread"] && current.created) {
+          (current.previousThreads ??= []).push({ threadId: current.threadId, created: current.created, sequence: current.sequence, seenActivities: current.seenActivities });
           Object.assign(current, { threadId: randomUUID(), created: false, sequence: 0, seenActivities: [] });
-        } else if (workflow !== "implement" && current.previousWorkflow === "implement") {
-          (current.implementationThreads ??= []).push(saved);
-          Object.assign(current, current.planningThread ?? { threadId: randomUUID(), created: false, sequence: 0, seenActivities: [] });
         }
         current.artifactParentId = gateIssue.parent?.id ?? gateIssue.id;
-        current.stage = { id: randomUUID(), workflow, statusId: gateIssue.state.id, teamId: gateIssue.team.id, skillPath };
+        current.stage = { id: randomUUID(), output: settings.output, statusId: gateIssue.state.id, teamId: gateIssue.team.id,
+          prompt: settings.prompt, instructions: projectConfig!.instructions, skills };
       });
       session = this.session(id);
     }
@@ -620,8 +622,8 @@ export class Bridge {
         this.store.update(s => { s.sessions[id].active!.turnId = latest.turnId; s.sessions[id].sequence = snapshot.sequence; });
         if (latest.state !== "running") {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
-          const planning = session.stage!.workflow !== "implement";
-          const result = deliveryResult(summary, session.stage!.workflow);
+          const planning = session.stage!.output !== "draft-pr";
+          const result = deliveryResult(summary, session.stage!.output);
           if (planning && result.complete && latest.state === "completed") {
             if (paused) return;
             const issue = await this.options.linear.issue(session.issueId);
@@ -664,16 +666,16 @@ export class Bridge {
         this.store.update(s => { s.sessions[id].status = "paused"; this.report(s, s.sessions[id], "error", "Worktree setup remains unconfirmed. Inspect and complete or repair setup in T3Code, then send resume."); });
         return;
       }
-      if (session.stage?.workflow === "implement" && await this.checkPr(session)) return;
+      if (session.stage?.output === "draft-pr" && await this.checkPr(session)) return;
       if (!stillCurrent()) return;
       const issue = await this.options.linear.issue(session.issueId);
       const directory = path.resolve(this.options.worktreeRoot, "context", session.threadId);
       const context = await this.options.linear.context(issue, directory);
-      if (session.stage!.workflow !== "grill-me" && issue.parent) {
+      if (session.stage!.output !== "comment" && issue.parent) {
         const parent = await this.options.linear.issue(issue.parent.id);
         if (!parent.description?.trim() || context.unavailable.some(source => source === `Linear issue ${parent.id}` || source === `${parent.url}#comments` || source === `${parent.url}#children` || source === `${parent.url}#relations` || source === `${parent.url}#inverseRelations`)) throw new IntegrationError("Required parent specification or decision/dependency context is unavailable. Restore access and send resume.", false);
       }
-      if (session.stage!.workflow === "to-tickets" && !issue.description?.trim()) throw new IntegrationError("A parent specification is required before ticket creation. Publish/review the specification and send resume.", false);
+      if (session.stage!.output === "tickets" && !issue.description?.trim()) throw new IntegrationError("A parent specification is required before ticket creation. Publish/review the specification and send resume.", false);
       const contextFile = path.join(directory, `${context.fingerprint}.json`);
       await writeFile(contextFile, context.text, { mode: 0o600 });
       const contextChange = session.contextFingerprint ? (session.contextFingerprint === context.fingerprint ? "Context unchanged." : "Context changed since the previous turn; read the refreshed material.") : "Initial context.";
@@ -685,7 +687,7 @@ export class Bridge {
       if (text.length > 100_000) {
         const turnFile = path.join(directory, `${turn.id}.txt`);
         await writeFile(turnFile, text, { mode: 0o600 });
-        text = `${instructions}\n\nRead the complete delegated turn at ${turnFile} before acting. Its context and follow-up exceed the transport input limit; the file preserves them in full.`;
+        text = `Read the complete delegated turn at ${turnFile} before acting. The file preserves the bridge instructions, configured status prompt, context and follow-up in full; they exceed the transport input limit.`;
       }
       if (!stillCurrent()) return;
       const launchIssue = await this.options.linear.issue(session.issueId);

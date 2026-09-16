@@ -2,7 +2,7 @@
 
 A fork of [hiasinho/linear-pi-agent](https://github.com/hiasinho/linear-pi-agent), adapted to connect Linear Agent Sessions to an existing [T3Code](https://github.com/pingdotgg/t3code) environment.
 
-Delegate a Linear issue to the app and select its workflow using a marker in its team status description. Grilling, specification and ticket creation share a planning conversation and publish artifacts in Linear. Implementation starts a fresh conversation, tests the work and delivers a draft GitHub PR. Humans review each output and move the issue to request the next stage. The bridge never advances statuses, delegates children or merges PRs.
+Delegate a Linear issue to the app and select its prompt and expected output using YAML in its project description. Grilling, specification and ticket creation share a planning conversation and publish artifacts in Linear. Implementation starts a fresh conversation, tests the work and delivers a draft GitHub PR. Humans review each output and move the issue to request the next stage. The bridge never advances statuses, delegates children or merges PRs.
 
 ## What changed from linear-pi-agent
 
@@ -11,7 +11,7 @@ The original project connects Linear to the Pi coding agent. This fork retains i
 | Area | This fork |
 | --- | --- |
 | Coding runtime | Your running T3Code environment and its configured providers/models |
-| Repository selection | A Linear project label matching an active T3Code project title |
+| Repository selection | A project YAML entry matching an active T3Code project title |
 | Session isolation | Preserved planning conversation; fresh implementation threads; shared session branch/workspace |
 | Recovery | SQLite-backed queues, command identities, pending requests and event replay positions |
 | Delivery | Linear planning artifacts; implementation draft PRs and validation reports |
@@ -26,7 +26,7 @@ Linear issue / Agent Session
   → progress, questions and results back to Linear
 ```
 
-When moving from linear-pi-agent, configure the T3Code connection and project labels below. Existing Pi sessions are not migrated to T3Code; start new delegations after setup.
+When moving from linear-pi-agent, configure the T3Code connection and project YAML below. Existing Pi sessions are not migrated to T3Code; start new delegations after setup.
 
 ## Requirements
 
@@ -66,7 +66,7 @@ Run the bridge on the **same host as T3Code**, under the account with access to 
 
    Setup saves answers privately in `.env`, generates a missing installation secret, derives the callback/webhook URLs and provides a pre-filled Linear application link. Review that form in your workspace, fill in **your developer name**, review the website and agent settings, and paste the generated Client ID, Client secret and webhook signing secret when prompted. If you already created the app, use it; do not create another. Webhooks must include **Agent Session events and Issue updates**. No field unsupported by Linear's manifest is claimed to be pre-filled.
 
-4. In Linear **Settings → Projects → Labels**, create exactly one **T3Code project** group. Add a child label whose name exactly matches your active T3Code project title, including case and spaces. Select that child on the **Linear project**, not the issue. When setup asks, supply an existing issue identifier from that project to check routing. Setup neither delegates it nor starts work. Model and workspace preferences come from T3Code; no UUIDs or routing JSON are needed.
+4. Add the YAML from [Project configuration](#project-configuration) as a code block in the Linear project's **detailed description**. Set `project` to the exact active T3Code project title, including case and spaces. Use the actual Linear team key and status names. When setup asks, supply an existing issue identifier from that project to check routing. Setup neither delegates it nor starts work. Model and workspace preferences come from T3Code; no UUIDs are needed.
 
 5. Start the bridge in another terminal:
 
@@ -84,34 +84,54 @@ Run the bridge on the **same host as T3Code**, under the account with access to 
 
 Use `npm run doctor` anytime for read-only diagnostics, or `npm run doctor -- --issue NOR-123` to inspect another project's association. Each check reports PASS, FAIL or UNVERIFIED and a repair step. Exit code 1 means setup is incomplete; 0 means available checks passed, with the displayed unverified checks still outstanding. Corrections use `npm run setup -- --replace KEY`; restart the bridge afterwards. If interrupted, just rerun setup. Keep `.env` private and never delete session or installation files to reconnect.
 
-When ready for real work, configure the skills and status markers below, then delegate an issue to the installed app. Keep the service running using [macOS/Linux operations](docs/operations.md#keep-the-bridge-running). Contributor checks and disposable delivery exercises live separately in [maintainer verification](docs/maintainer-verification.md).
+When ready for real work, configure the YAML and required skills below, then delegate an issue to the installed app. Keep the service running using [macOS/Linux operations](docs/operations.md#keep-the-bridge-running). Contributor checks and disposable delivery exercises live separately in [maintainer verification](docs/maintainer-verification.md).
+
+## Project configuration
+
+Add exactly one fenced YAML block with a top-level `t3code` key to the project's detailed description. The API field is `Project.content`, not the short summary (`Project.description`). Linear may return an unlabelled code fence; both forms work. Ordinary project prose and unrelated code blocks can surround it. Labels and status-description markers are no longer read.
+
+[Complete four-stage example](docs/examples/project-config.yaml): replace the T3Code title, team key and status names with your actual values. Every configured status must exist, even if it is not currently selected. For a minimal implementation-only project:
+
+```yaml
+t3code:
+  version: 1
+  project: "My T3Code Project"
+  instructions: |
+    Preserve agreed decisions and explain blockers clearly.
+  workflows:
+    - team: "NOR"
+      statuses:
+        "Todo":
+          new-thread: true
+          output: draft-pr
+          required-skills: [implement]
+          prompt: |
+            Use $implement to implement this issue.
+            Read the linked context, test the changes and open a draft PR.
+```
+
+`version`, `project`, `workflows`, and each status's `prompt` and `output` are required. `instructions` is optional shared text. `required-skills` defaults to `[]`; `new-thread` defaults to `false`. These are strict schemas: unsupported keys, outputs and versions, duplicate YAML keys, repeated teams, multiple configuration blocks, aliases and malformed YAML pause execution. Team keys and status names match exactly, including case, and resolve to unique IDs. Teams must belong to the Linear project. Statuses omitted from the mapping are holding/review states.
+
+| Output | Completion contract |
+| --- | --- |
+| `comment` | Publish the summary/decisions as a parent comment (current issue if it has no parent); no specification or children |
+| `specification` | Publish a reviewable specification in the parent issue description |
+| `tickets` | Publish an approved breakdown of native Linear children with acceptance criteria and blocking links |
+| `draft-pr` | Report passing validation and verify an open draft GitHub PR |
+
+Prompts select how work is performed; `output` selects what the bridge validates and publishes. Outputs do not implicitly invoke a particular skill. List any prerequisites in `required-skills` and invoke them in the prompt (for example, `Use $implement`). Install and maintain these skills in the selected provider's T3Code execution environment. Missing, disabled, non-user-invocable or ambiguous skills block execution. The bridge does not install skills, and required human reviews remain in effect. Repository/provider/model/workspace and service credentials are not configurable through prompts.
 
 ## Status-driven workflows
 
-In **Settings → Teams → your team → Issue statuses → Edit**, add exactly one standalone marker to the status description. Ordinary prose can surround it:
+Both delegation to the installed app and a configured status are required. Initial delegation starts the selected stage. The bridge verifies the latest Linear Agent Session for the installed app using source creation times; delayed webhooks cannot take ownership back. A replacement waits for superseded providers to stop, and superseded sessions cannot resume. Subscribe the OAuth webhook to **Issue updates as well as Agent Session events**. Unrelated board movement cannot create a session.
 
-```text
-Ready to challenge assumptions and clarify requirements.
+On entering a configured status, the bridge snapshots its prompt, shared instructions, output and required skill paths. Follow-ups and restarts retain that snapshot and refresh Linear task context. YAML edits alone do not start work or alter an existing invocation; the next stage entry reads the latest configuration. Correct failed configuration and send `resume` to retry.
 
-t3code: grill-me
-```
+`new-thread: true` creates a fresh thread when entering that status, including re-entry, while preserving the session's branch, worktree, files, PR and artifact identities. Follow-ups stay in that thread. With `false` or omission, reuse the current thread, creating one if none exists. Returning to a planning status reuses the current conversation; there is no special restoration of a previous planning conversation. Separate delegations always have separate session threads. Long prompts and context are supplied through a complete-turn file when they exceed the transport limit; content is not truncated.
 
-| Marker | Required operator-installed skill | Output |
-| --- | --- | --- |
-| `t3code: grill-me` | `grill-me` | Parent comments containing Q&A, decisions and uncertainty |
-| `t3code: to-spec` | `to-spec` | Current specification in the parent issue description |
-| `t3code: to-tickets` | `to-tickets` | Reviewed native Linear children, acceptance criteria and blocking links |
-| `t3code: implement` | `implement` | Validated work and a reviewable draft PR |
+Humans move issues between stages. A stage change, move to an unconfigured status or removal of delegation stops execution first. Old questions, responses and queued prompts become inactive. The bridge confirms provider stop, then rechecks status/delegation so rapid moves cannot launch intermediate stages. A failed transition stop retains capacity and checkout ownership; repair T3Code and send `resume` to retry. Explicit `cancel` retires pending publication and queued work. Already accepted remote changes remain preserved. Current-checkout cancellation ends the session; worktree cancellation remains resumable. `resume` cannot bypass the status/delegation gate or reopen an ended session.
 
-Markers are case-sensitive, with exactly one space after the colon; surrounding whitespace is allowed. Multiple markers, unsupported references or malformed marker lines pause with correction instructions. Unmarked statuses are holding/review states. Selection uses the actual team and status IDs, never their names. This configuration applies across the team's projects and cannot override routing, models or permissions.
-
-Install and maintain these skills in the selected provider's T3Code execution environment. The bridge checks the provider's workspace skill catalog through `server.refreshProviders` before starting a stage; disabled, non-user-invocable, missing or ambiguous skills block execution. It does not install or synchronize skills. It invokes the installed skill and preserves its review requirements. Linear publication instructions override target-repository tracker defaults for these workflows.
-
-Both delegation to the installed app and a marked status are required. Initial delegation starts the selected stage. The bridge verifies the latest Linear Agent Session for the installed app using source creation times; delayed webhooks cannot take ownership back. A replacement session waits for superseded providers to stop, and superseded sessions cannot resume. Missing or ambiguous session identity prevents execution. Later Issue state/delegate updates cause a fresh current-state check; unrelated board movement cannot create a session. Subscribe the OAuth webhook to **Issue updates as well as Agent Session events**. Editing a status description alone does not start work or change an active stage. New invocations resolve the current marker and skill. Follow-ups retain the current stage and refresh Linear context.
-
-Humans move the parent forward or backward among planning stages. These transitions reuse its planning thread. Delegating a child starts a fresh implementation thread with the current ticket, parent specification, decisions and dependencies. Small issues can enter implementation directly; moving from planning into implementation on the same issue also starts fresh while retaining its branch, workspace and PR state. Returning to planning restores its saved conversation. Implementation follow-ups reuse the current implementation thread and open PR.
-
-A stage change, move to an unmarked status or removal of delegation stops execution first. Old questions, responses and queued prompts become inactive. The bridge confirms provider stop, then rechecks current status/delegation so rapid moves cannot launch intermediate stages. A failed transition stop retains capacity and checkout ownership; repair T3Code and send `resume` to retry the stop. Explicit `cancel` retires pending publication as well as queued work; later feedback cannot publish the cancelled draft. Publication checks cancellation again after its preflight reads, before sending a write. Already accepted remote changes remain preserved. Explicit `cancel` retains its existing terminal current-checkout behavior. `resume` cannot bypass the status/delegation gate or reopen an ended session.
+When upgrading from labels/markers, add project YAML and restart the bridge on the new build. Cancel old workflow sessions and start fresh delegations; legacy persisted stages cannot use the new configuration. Preserve the database and installation credentials.
 
 ### Artifacts and revisions
 
@@ -125,7 +145,7 @@ Completing a stage never moves the board. Planning completion requires its actua
 
 ## Routing and permissions
 
-The bridge reads the selected child of the **T3Code project** project label group and matches its name exactly, case-sensitively, against active T3Code project titles. Deleted projects are excluded. Missing projects/groups/selections, multiple groups or selections, unknown titles and duplicate matching titles pause the session before execution. Duplicate-title errors list the matching workspace paths. Correct the labels or T3Code configuration, then send `resume`. Duplicate webhook delivery and ordinary follow-ups do not retry failed initial resolution.
+The bridge matches the YAML `project` value exactly against active T3Code project titles. Deleted projects are excluded. Missing configuration, invalid team/status mappings, unknown titles and duplicate matching titles pause before execution. Duplicate-title errors list the matching workspace paths. Correct the YAML or T3Code configuration, then send `resume`. Duplicate webhook delivery and ordinary follow-ups do not retry failed initial resolution.
 
 Provider/model choices come from T3Code's project overrides and environment defaults, with provider availability checked before work starts. A null snapshot override inherits the environment; a cleared effective model pauses until configured. The bridge does not choose a fallback model. Workspace precedence is the T3Code project setting, then repository `t3.json`, then the environment default. JSONC comments and trailing commas in `t3.json` are supported.
 
@@ -134,7 +154,7 @@ Provider/model choices come from T3Code's project overrides and environment defa
 
 A competing current-checkout session pauses and identifies the occupying session. Once that session ends through PR closure/merge or confirmed cancellation, send `resume` to the waiting session. It never starts automatically when the checkout becomes free. Independent worktree sessions can run concurrently within `MAX_CONCURRENT_SESSIONS`.
 
-The resolved project, workspace, model selection, workspace mode and branch/worktree identity persist for the session. Later renames, label edits and settings changes apply to new sessions. Issue text cannot select an arbitrary checkout. `PROJECT_ROUTES`, `T3CODE_PROVIDER` and `T3CODE_MODEL` are no longer used; this change has no legacy routing fallback or old-session migration.
+The resolved project, workspace, model selection, workspace mode and branch/worktree identity persist for the session. Later project-title edits, renames and T3Code settings changes apply to new sessions. Status configuration is refreshed on each new stage entry. Issue text cannot select an arbitrary checkout. `PROJECT_ROUTES`, `T3CODE_PROVIDER` and `T3CODE_MODEL` are no longer used; this change has no legacy routing fallback or old-session migration.
 
 Access to this agent in the configured Linear workspace authorizes coding and draft-PR work with **full execution permissions**. Run both services under a dedicated OS account containing only intended credentials and integrations. Worktrees isolate checkouts; routing and T3Code projects are **not filesystem sandboxes**. The operator provisions that account. Keep T3Code private and use a bearer credential permitting the required orchestration, settings/provider and VCS read operations. The installed T3Code version determines the exact scopes; settings RPC failures identify missing access.
 

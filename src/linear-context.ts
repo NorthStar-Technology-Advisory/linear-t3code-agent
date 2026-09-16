@@ -1,3 +1,4 @@
+import { readProjectConfig } from "./project-config.js";
 import { projectTitle } from "./project-routing.js";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -53,6 +54,9 @@ export class LinearClient {
     sessions.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
     if (!sessions[0] || (sessions[1] && Date.parse(sessions[0].createdAt) === Date.parse(sessions[1].createdAt))) throw new Error("Current Linear session is missing or ambiguous; no work can start until ownership is verified.");
     return sessions[0].id;
+  }
+  projectConfig(projectId: string | undefined) {
+    return readProjectConfig((query, variables) => this.query(query, variables), projectId);
   }
   projectTitle(projectId: string | undefined): Promise<string> {
     return projectTitle((query, variables) => this.query(query, variables), projectId);
