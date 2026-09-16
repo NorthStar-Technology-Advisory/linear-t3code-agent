@@ -32,6 +32,26 @@ export class LinearClient {
     if (!data.issue) throw new Error("Linear issue is unavailable; restore access and resume.");
     return { ...data.issue, delegated: Boolean(data.issue.delegate && data.issue.delegate.id === data.viewer?.id) };
   }
+  async currentSession(issueId: string): Promise<string> {
+    type AgentSession = { id: string; createdAt: string; appUser: { id: string } };
+    const sessions: AgentSession[] = [];
+    const cursors = new Set<string>();
+    let after: string | undefined;
+    do {
+      const data = await this.query<{ viewer: { id: string }; issue: { agentSessions: Connection<AgentSession> } | null }>(`query BridgeCurrentSession($id: String!, $after: String) { viewer { id } issue(id: $id) { agentSessions(first: 100, after: $after, includeArchived: true) { nodes { id createdAt appUser { id } } pageInfo { hasNextPage endCursor } } } }`, { id: issueId, after });
+      const connection = data.issue?.agentSessions;
+      if (!connection || !data.viewer?.id) throw new Error("Current Linear session identity is unavailable; no work can start until ownership is verified.");
+      sessions.push(...connection.nodes.filter(session => session.appUser.id === data.viewer.id));
+      if (!connection.pageInfo.hasNextPage) break;
+      after = connection.pageInfo.endCursor;
+      if (!after || cursors.has(after)) throw new Error("Linear session pagination did not advance; ownership could not be verified.");
+      cursors.add(after);
+    } while (true);
+    if (sessions.some(session => !Number.isFinite(Date.parse(session.createdAt)))) throw new Error("Linear session chronology is invalid; ownership could not be verified.");
+    sessions.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    if (!sessions[0] || (sessions[1] && Date.parse(sessions[0].createdAt) === Date.parse(sessions[1].createdAt))) throw new Error("Current Linear session is missing or ambiguous; no work can start until ownership is verified.");
+    return sessions[0].id;
+  }
   async projectTitle(projectId: string | undefined): Promise<string> {
     const correction = 'Configure the Linear project label group "T3Code project" with exactly one selected child whose name matches a T3Code project title, then send resume.';
     if (!projectId) throw new Error(`This issue has no Linear project. ${correction}`);
@@ -142,9 +162,10 @@ export class LinearClient {
     return file;
   }
 
-  async comment(issueId: string, body: string, id: string): Promise<void> {
+  async comment(issueId: string, body: string, id: string, isCurrent: () => boolean = () => true): Promise<void> {
     const data = await this.query<{ issue: { comments: { nodes: Array<{ id: string }> } } }>(`query BridgeArtifactComment($id: String!, $commentId: ID!) { issue(id: $id) { comments(filter: { id: { eq: $commentId } }, first: 1) { nodes { id } } } }`, { id: issueId, commentId: id });
     if (data.issue.comments.nodes.some(c => c.id === id)) return;
+    if (!isCurrent()) return;
     const result = await this.query<{ commentCreate: { success: boolean } }>(`mutation BridgeArtifactCommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`, { input: { id, issueId, body } });
     if (!result.commentCreate.success) throw new Error("Linear discussion publication failed; retry will reconcile its retained identity.");
   }

@@ -24,8 +24,9 @@ type QueuedTurn = { id: string; body: string };
 type PendingRequest = { id: string; kind: "approval" | "question"; description: string; response?: RunnerCommand; responseUnconfirmed?: boolean; responseMode?: string; questions?: Array<{ id: string; question: string; multiSelect?: boolean }>; };
 type SavedThread = { threadId: string; created: boolean; sequence: number; seenActivities: string[] };
 type Session = {
-  id: string; workspaceId: string; issueId: string; teamId?: string;
+  id: string; workspaceId: string; issueId: string; teamId?: string; supersededBy?: string;
   artifactParentId?: string;
+  publicationPreparationBlocked?: boolean;
   publication?: Publication; publicationHistory?: Publication[]; artifacts?: ArtifactIdentities;
   stage?: Stage; previousWorkflow?: Stage["workflow"]; planningThread?: SavedThread; implementationThreads?: SavedThread[];
   gate?: string; gateRevision?: number; gateDirty?: boolean; transition?: boolean; retiredRequests?: string[];
@@ -68,7 +69,7 @@ export class Bridge {
         if (state.deliveries.includes(key)) return;
         state.deliveries.push(key);
         for (const session of Object.values(state.sessions)) {
-          if (session.issueId !== event.data.id || session.status === "closed") continue;
+          if (session.issueId !== event.data.id || session.status === "closed" || session.supersededBy) continue;
           session.gateDirty = true;
           session.gateRevision = (session.gateRevision ?? 0) + 1;
         }
@@ -88,6 +89,12 @@ export class Bridge {
       let session = Object.hasOwn(state.sessions, id) ? state.sessions[id] : undefined;
       if (!session) {
         if (!payload.agentSession.issue?.id) throw new Error("Agent session requires an issue ID.");
+        for (const other of Object.values(state.sessions)) {
+          if (other.issueId === payload.agentSession.issue.id && other.status !== "closed" && !other.supersededBy) {
+            other.gateDirty = true;
+            other.gateRevision = (other.gateRevision ?? 0) + 1;
+          }
+        }
         const threadId = randomUUID();
         const now = new Date().toISOString();
         session = state.sessions[id] = {
@@ -109,12 +116,17 @@ export class Bridge {
         state.outbox = state.outbox.filter(o => o.sessionId !== id || o.issueId);
         return;
       }
+      if (session.supersededBy) {
+        this.report(state, session, "error", `This session was superseded by ${session.supersededBy}. Send feedback to the current issue session; this session cannot resume.`);
+        return;
+      }
       if (body === "resume" && session.status === "cancelling" && session.transition) {
         delete session.stopSent; delete session.cancelCommand;
         this.report(state, session, "thought", "Retrying provider stop for the stage transition. The next stage still waits for confirmed stop.");
         return;
       }
       if (body === "resume" && session.status === "paused") {
+        delete session.publicationPreparationBlocked;
         session.status = "queued";
         if (session.bootstrapRecoveryPending) {
           if (session.command) delete session.command.bootstrap;
@@ -157,11 +169,12 @@ export class Bridge {
         }
         return;
       }
-      if (session.status === "paused" && session.publication?.blocked) {
-        (session.publicationHistory ??= []).push(session.publication);
+      if (session.status === "paused" && (session.publication?.blocked || session.publicationPreparationBlocked)) {
+        if (session.publication) (session.publicationHistory ??= []).push(session.publication);
+        delete session.publicationPreparationBlocked;
         delete session.publication; delete session.active; delete session.command;
         session.status = "queued";
-        this.report(state, session, "thought", "Conflicting publication preserved in history. Revising the current stage using refreshed Linear artifacts and your feedback.");
+        this.report(state, session, "thought", "Revising the blocked planning output using refreshed Linear artifacts and your feedback. Previous output and any prepared publication remain in history.");
       }
       session.queue.push({ id: randomUUID(), body: this.prompt(payload) });
       if (session.status === "idle" || session.status === "cancelled") session.status = "queued";
@@ -227,6 +240,8 @@ export class Bridge {
     }));
   }
   private requestCancellation(session: Session) {
+    if (session.publication) { (session.publicationHistory ??= []).push(session.publication); delete session.publication; }
+    delete session.publicationPreparationBlocked;
     session.retiredRequests = [...(session.retiredRequests ?? []), ...session.requests.map(r => r.id)];
     session.generation++;
     session.cancelHadActive = Boolean(session.active);
@@ -376,7 +391,6 @@ export class Bridge {
           current.seenActivities = [...new Set([...current.seenActivities, ...snapshot.thread.activities.map(a => a.id)])];
           current.retiredRequests = [...new Set([...(current.retiredRequests ?? []), ...snapshot.thread.activities.flatMap(a => typeof a.payload?.requestId === "string" ? [a.payload.requestId] : [])])];
         }
-        if (current.publication) { (current.publicationHistory ??= []).push(current.publication); delete current.publication; }
         current.previousWorkflow = current.stage?.workflow ?? current.previousWorkflow;
         delete current.stage;
         current.status = "queued";
@@ -386,26 +400,40 @@ export class Bridge {
         this.report(s, current, "thought", "Previous stage stopped. Its questions and queued replies are inactive; conversation, artifacts, branch and files are preserved. Rechecking current status and delegation before the next stage.");
         return;
       }
-      const ended = current.route?.workspaceMode === "local";
+      const ended = Boolean(current.supersededBy) || current.route?.workspaceMode === "local";
       current.status = ended ? "closed" : current.queue.length ? "queued" : "cancelled";
       if (ended) current.queue = [];
       if (current.command?.bootstrap && current.worktree && !snapshot?.thread.messages.some(m => m.id === current.active?.messageId)) current.bootstrapRecoveryPending = true;
       current.created = Boolean(snapshot);
       delete current.active; delete current.command; delete current.cancelCommand; delete current.interrupted; delete current.stopSent;
-      const outcome = current.cancelHadActive ? "T3Code provider stopped by user." : "No active coding turn remained; any T3Code provider session is stopped.";
+      const outcome = current.supersededBy ? `This session was superseded by ${current.supersededBy}; provider stop is confirmed.` : current.cancelHadActive ? "T3Code provider stopped by user." : "No active coding turn remained; any T3Code provider session is stopped.";
       delete current.cancelHadActive;
-      this.report(s, current, "error", `${outcome}${ended ? " This current-checkout session has ended and its reservation is released. Start a new delegation for further work; resume cannot reopen it." : ""} Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved. Descendant-process cleanup is delegated to T3Code.`);
+      this.report(s, current, "error", `${outcome}${ended && !current.supersededBy ? " This current-checkout session has ended and its reservation is released. Start a new delegation for further work; resume cannot reopen it." : ""} Pending prompts cleared; thread, branch, worktree, changes and any PR are preserved. Descendant-process cleanup is delegated to T3Code.`);
     });
   }
   private async step(id: string) {
     let session = this.session(id);
     if (session.status === "cancelling") { await this.cancel(session); return; }
+    if (session.supersededBy || session.status === "closed") return;
     if (session.pr && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) {
       if (await this.checkPr(session)) return;
     }
     const generation = session.generation;
     const gateRevision = session.gateRevision ?? 0;
     const stillCurrent = () => this.session(id).generation === generation && (this.session(id).gateRevision ?? 0) === gateRevision;
+    const owner = await this.options.linear.currentSession(session.issueId);
+    if (!stillCurrent()) return;
+    this.store.update(state => {
+      for (const other of Object.values(state.sessions)) {
+        if (other.issueId !== session.issueId || other.id === owner || other.status === "closed" || other.supersededBy) continue;
+        other.supersededBy = owner;
+        delete other.transition; delete other.gateDirty;
+        this.requestCancellation(other);
+        state.outbox = state.outbox.filter(o => o.sessionId !== other.id || o.issueId);
+      }
+    });
+    if (owner !== id || !stillCurrent()) return;
+    if (Object.values(this.store.read().sessions).some(other => other.issueId === session.issueId && other.supersededBy && other.status !== "closed")) return;
     const gateIssue = await this.options.linear.issue(session.issueId);
     if (!stillCurrent()) return;
     const gate = workflowGate(gateIssue);
@@ -556,7 +584,7 @@ export class Bridge {
     }
     if (session.publication) {
       if (paused) return;
-      const adoptedRelationId = await publishNext(this.options.linear, session.publication);
+      const adoptedRelationId = await publishNext(this.options.linear, session.publication, stillCurrent);
       if (!stillCurrent()) return;
       this.store.update(s => {
         const current = s.sessions[id];
@@ -586,9 +614,21 @@ export class Bridge {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
           const planning = session.stage!.workflow !== "implement";
           const result = deliveryResult(summary, session.stage!.workflow);
-          if (planning && result.complete && latest.state === "completed" && !paused) {
+          if (planning && result.complete && latest.state === "completed") {
+            if (paused) return;
             const issue = await this.options.linear.issue(session.issueId);
-            const prepared = await preparePublication(this.options.linear, issue, session.stage!.id, result.artifacts, result.summary!, result.body, session.artifacts ?? { children: {}, relations: {} });
+            let prepared: Awaited<ReturnType<typeof preparePublication>>;
+            try {
+              prepared = await preparePublication(this.options.linear, issue, session.stage!.id, result.artifacts, result.summary!, result.body, session.artifacts ?? { children: {}, relations: {} });
+            } catch (error) {
+              if (!stillCurrent()) return;
+              if (error instanceof IntegrationError && !error.retryable) this.store.update(s => {
+                const current = s.sessions[id];
+                current.publicationPreparationBlocked = true;
+                delete current.active;
+              });
+              throw error;
+            }
             if (!stillCurrent()) return;
             this.store.update(s => { s.sessions[id].publication = prepared.publication; s.sessions[id].artifacts = prepared.identities; });
             return;
@@ -599,10 +639,10 @@ export class Bridge {
             const current = s.sessions[id];
             current.pr = pr ?? current.pr;
             delete current.active;
-            const success = latest.state === "completed" && result.complete && (planning || (pr?.state === "OPEN" && pr.isDraft));
+            const success = latest.state === "completed" && result.complete && !planning && pr?.state === "OPEN" && pr.isDraft;
             current.status = success && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
             delete current.command;
-            const prReport = planning ? "Stage finished. Waiting for human direction; status unchanged." : pr ? `PR: ${pr.url} (${pr.state}, ${pr.isDraft ? "draft" : "not draft"})` : "No draft PR found; delivery is incomplete.";
+            const prReport = planning ? "Planning output has not been published; the stage is incomplete." : pr ? `PR: ${pr.url} (${pr.state}, ${pr.isDraft ? "draft" : "not draft"})` : "No draft PR found; delivery is incomplete.";
             this.report(s, current, success ? "response" : "error", `${prReport}\n\n${result.body}${success && paused ? "\n\nQueued prompts remain paused after an integration failure; send resume or cancel." : success ? "" : `\n\nT3Code turn ${latest.state}. Queued prompts are preserved and paused; send resume or cancel.`}`);
           });
         }
@@ -642,10 +682,11 @@ export class Bridge {
       if (!stillCurrent()) return;
       const launchIssue = await this.options.linear.issue(session.issueId);
       if (!stillCurrent()) return;
-      if (workflowGate(launchIssue) !== gate) {
+      if (workflowGate(launchIssue) !== gate || await this.options.linear.currentSession(session.issueId) !== id) {
         this.store.update(s => { s.sessions[id].gateDirty = true; });
         return;
       }
+      if (!stillCurrent()) return;
       const command: RunnerCommand = {
         type: "thread.turn.start", commandId: randomUUID(), threadId: session.threadId,
         message: { messageId: turn.id, role: "user", text, attachments: [] },

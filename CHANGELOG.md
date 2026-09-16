@@ -1,5 +1,11 @@
 # Changelog
 
+## NOR-197 — review fixes
+
+- Resolve the current issue session from Linear's session chronology, stop superseded providers before replacement work, and reject stale session follow-ups.
+- Retire publication on explicit cancellation and guard writes after asynchronous preflight reads.
+- Keep rejected publication preparation incomplete and allow corrected feedback without a false completion response.
+
 ## NOR-197 — status-driven workflows
 
 - Select grilling, specification, tickets or implementation through team status-description markers and explicit delegation.

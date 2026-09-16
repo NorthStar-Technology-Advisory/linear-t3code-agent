@@ -86,10 +86,11 @@ export async function preparePublication(linear: LinearClient, issue: IssueConte
 }
 
 /** A lost acknowledgement is reconciled by identity/content before retrying one write. */
-export async function publishNext(linear: LinearClient, publication: Publication): Promise<string | void> {
+export async function publishNext(linear: LinearClient, publication: Publication, isCurrent: () => boolean): Promise<string | void> {
   const operation = publication.operations[publication.cursor];
   if (!operation) return;
   const mutate = async (query: string, variables: Record<string, unknown>) => {
+    if (!isCurrent()) return;
     const data = await linear.query<Record<string, { success: boolean }>>(query, variables);
     if (Object.values(data).length !== 1 || !Object.values(data).every(value => value.success === true)) throw new IntegrationError("Linear artifact publication failed; preserved publication will be reconciled.");
   };
@@ -121,6 +122,6 @@ export async function publishNext(linear: LinearClient, publication: Publication
     if (!child || !unstarted(child)) throw new IntegrationError(`Child ${operation.relatedIssueId} is no longer unstarted; review its dependencies manually.`, false);
     await mutate(`mutation BridgeArtifactRelation($input: IssueRelationCreateInput!) { issueRelationCreate(input: $input) { success } }`, { input: { id: operation.id, type: "blocks", issueId: operation.issueId, relatedIssueId: operation.relatedIssueId } });
   } else {
-    await linear.comment(operation.issueId, operation.body, operation.id);
+    await linear.comment(operation.issueId, operation.body, operation.id, isCurrent);
   }
 }
