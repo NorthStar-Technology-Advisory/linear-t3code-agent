@@ -1,3 +1,4 @@
+import { matchProject } from "./project-routing.js";
 import { preparePublication, publishNext, type Publication, type ArtifactIdentities } from "./artifacts.js";
 import { selectWorkflow, workflowGate, type Stage } from "./workflow.js";
 import { randomUUID } from "node:crypto";
@@ -472,10 +473,7 @@ export class Bridge {
       let route: Route;
       try {
         const title = await this.options.linear.projectTitle(issue.project?.id);
-        const matches = (await this.options.runner.projects()).filter(p => p.deletedAt === null && p.title === title);
-        if (matches.length === 0) throw new Error(`No active T3Code project has the exact title "${title}". Correct the label or project title, then send resume.`);
-        if (matches.length > 1) throw new Error(`Multiple T3Code projects have title "${title}": ${matches.map(p => p.workspaceRoot).join(", ")}. Rename them to unique titles, correct the label, then send resume.`);
-        const project = matches[0]!;
+        const project = matchProject(await this.options.runner.projects(), title);
         const execution = await this.options.runner.execution(project);
         route = { repository: execution.workspaceMode === "local" ? await realpath(project.workspaceRoot) : project.workspaceRoot, t3ProjectId: project.id, ...execution, baseBranch: "" };
         if (route.workspaceMode === "worktree") route.baseBranch = await this.options.runner.baseBranch(route.repository);

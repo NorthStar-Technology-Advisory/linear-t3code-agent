@@ -1,3 +1,4 @@
+import { projectTitle } from "./project-routing.js";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -53,33 +54,8 @@ export class LinearClient {
     if (!sessions[0] || (sessions[1] && Date.parse(sessions[0].createdAt) === Date.parse(sessions[1].createdAt))) throw new Error("Current Linear session is missing or ambiguous; no work can start until ownership is verified.");
     return sessions[0].id;
   }
-  async projectTitle(projectId: string | undefined): Promise<string> {
-    const correction = 'Configure the Linear project label group "T3Code project" with exactly one selected child whose name matches a T3Code project title, then send resume.';
-    if (!projectId) throw new Error(`This issue has no Linear project. ${correction}`);
-    type Label = { id: string; name: string; isGroup: boolean; parent: { id: string } | null };
-    const read = async (selected: boolean) => {
-      const labels: Label[] = [];
-      let after: string | undefined;
-      const cursors = new Set<string>();
-      do {
-        const selection = 'nodes { id name isGroup parent { id } } pageInfo { hasNextPage endCursor }';
-        const data = await this.query<{ projectLabels?: Connection<Label>; project?: { labels: Connection<Label> } | null }>(selected
-          ? `query BridgeProjectLabels($id: String!, $after: String) { project(id: $id) { labels(first: 100, after: $after) { ${selection} } } }`
-          : `query BridgeProjectGroups($after: String) { projectLabels(first: 100, after: $after) { ${selection} } }`, { id: projectId, after });
-        const connection = selected ? data.project?.labels : data.projectLabels;
-        if (!connection) throw new Error(`Linear project labels are unavailable. ${correction}`);
-        labels.push(...connection.nodes);
-        if (!connection.pageInfo.hasNextPage) return labels;
-        after = connection.pageInfo.endCursor;
-        if (!after || cursors.has(after)) throw new Error("Linear project label pagination did not advance; restore access and send resume.");
-        cursors.add(after);
-      } while (true);
-    };
-    const groups = (await read(false)).filter(label => label.isGroup && label.name === "T3Code project");
-    if (groups.length !== 1) throw new Error(`Found ${groups.length} groups named "T3Code project"; exactly one is required. ${correction}`);
-    const selected = (await read(true)).filter(label => !label.isGroup && label.parent?.id === groups[0]!.id);
-    if (selected.length !== 1) throw new Error(`Found ${selected.length} selected T3Code project labels; exactly one is required. ${correction}`);
-    return selected[0]!.name;
+  projectTitle(projectId: string | undefined): Promise<string> {
+    return projectTitle((query, variables) => this.query(query, variables), projectId);
   }
   private async connection<T>(id: string, field: keyof typeof fields): Promise<T[]> {
     const nodes: T[] = [];

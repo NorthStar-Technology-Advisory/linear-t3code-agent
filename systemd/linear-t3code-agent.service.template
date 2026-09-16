@@ -10,8 +10,8 @@ WorkingDirectory=%h/linear-t3code-agent
 EnvironmentFile=%h/linear-t3code-agent/.env
 Environment=TOKEN_STORE_PATH=%h/linear-t3code-agent/data/linear-tokens.json
 Environment=STATE_STORE_PATH=%h/linear-t3code-agent/data/oauth-states.json
-Environment=PATH=%h/.local/share/mise/installs/node/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=%h/.local/share/mise/installs/node/latest/bin/node dist/server.js
+Environment=PATH=REPLACE_WITH_SERVICE_ACCOUNT_PATH
+ExecStart=REPLACE_WITH_ABSOLUTE_NODE_PATH dist/server.js
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
