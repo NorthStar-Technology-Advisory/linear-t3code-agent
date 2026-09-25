@@ -44,7 +44,8 @@ type Session = {
   lastReportAt: number; lastError?: string; contextFingerprint?: string;
 };
 type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
-type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[] };
+type Undeliverable = Outbound & { failedAt: string; reason: "session archived" };
+type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
   pullRequests: PullRequests; prPollMs: number;
@@ -54,6 +55,7 @@ export type BridgeOptions = {
 
 export class Bridge {
   private readonly store: BridgeStore<State>;
+  private readonly deliveryRetryAt = new Map<string, number>();
   private ticking?: Promise<void>;
   private timer?: NodeJS.Timeout;
   constructor(private readonly options: BridgeOptions) {
@@ -225,14 +227,37 @@ export class Bridge {
     return this.ticking;
   }
   private async work() {
+    const failedSessions = new Set<string>();
     for (const outgoing of this.store.read().outbox) {
+      if (failedSessions.has(outgoing.sessionId)) continue;
+      if ((this.deliveryRetryAt.get(outgoing.sessionId) ?? 0) > Date.now()) { failedSessions.add(outgoing.sessionId); continue; }
       try {
         if (!this.store.read().outbox.some(o => o.id === outgoing.id)) continue;
         this.store.update(s => { s.outbox.find(o => o.id === outgoing.id)!.attempted = true; });
         if (outgoing.issueId) await this.options.linear.comment(outgoing.issueId, redact(outgoing.body), outgoing.id);
         else await this.options.linear.activity(outgoing.sessionId, { type: outgoing.type, body: redact(outgoing.body) }, outgoing.id, outgoing.attempted);
         this.store.update(s => { s.outbox = s.outbox.filter(o => o.id !== outgoing.id); });
-      } catch { console.error("Linear activity delivery failed; update retained", { agentSessionId: outgoing.sessionId, activityId: outgoing.id }); break; }
+      } catch {
+        const issueId = this.store.read().sessions[outgoing.sessionId]?.issueId;
+        let archived = false;
+        if (!outgoing.issueId && issueId) {
+          try { archived = await this.options.linear.sessionArchived(issueId, outgoing.sessionId); }
+          catch { /* Verification failed; retain the activity for retry. */ }
+        }
+        if (archived) {
+          this.deliveryRetryAt.delete(outgoing.sessionId);
+          this.store.update(state => {
+            const retired = state.outbox.filter(item => item.sessionId === outgoing.sessionId && !item.issueId);
+            (state.undeliverable ??= []).push(...retired.map(item => ({ ...item, failedAt: new Date().toISOString(), reason: "session archived" as const })));
+            state.outbox = state.outbox.filter(item => !retired.some(entry => entry.id === item.id));
+          });
+          console.error("Linear session is archived; undelivered activities retained in the failure record", { agentSessionId: outgoing.sessionId });
+        } else {
+          this.deliveryRetryAt.set(outgoing.sessionId, Date.now() + 60_000);
+          failedSessions.add(outgoing.sessionId);
+          console.error("Linear activity delivery failed; update retained for retry", { agentSessionId: outgoing.sessionId, activityId: outgoing.id });
+        }
+      }
     }
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];

@@ -163,4 +163,23 @@ export class LinearClient {
     }
     return createAgentActivity(sessionId, content, { id, endpoint: this.endpoint, tokenPath: this.tokenPath });
   }
+
+  async sessionArchived(issueId: string, sessionId: string): Promise<boolean> {
+    let after: string | undefined;
+    const cursors = new Set<string>();
+    do {
+      const data = await this.query<{ issue: { agentSessions: Connection<{ id: string; archivedAt: string | null }> } | null }>(
+        `query BridgeDeliverySessions($id: String!, $after: String) { issue(id: $id) { agentSessions(first: 100, after: $after, includeArchived: true) { nodes { id archivedAt } pageInfo { hasNextPage endCursor } } } }`,
+        { id: issueId, after },
+      );
+      const sessions = data.issue?.agentSessions;
+      if (!sessions) return false;
+      const target = sessions.nodes.find(session => session.id === sessionId);
+      if (target) return Boolean(target.archivedAt);
+      if (!sessions.pageInfo.hasNextPage) return false;
+      after = sessions.pageInfo.endCursor;
+      if (!after || cursors.has(after)) throw new Error("Linear session pagination did not advance; delivery status could not be verified.");
+      cursors.add(after);
+    } while (true);
+  }
 }

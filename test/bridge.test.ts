@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createServer, type Server } from "node:http";
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 Object.assign(process.env, {
   NODE_ENV: "test", DOTENV_CONFIG_PATH: "/dev/null",
@@ -56,6 +57,8 @@ async function fixture(t: TestContext) {
   let heldIssueRead: { remaining: number; entered: () => void; wait: Promise<void> } | undefined;
   const reads: any[] = [];
   const linearSessions = new Map<string, { id: string; issueId: string; createdAt: string; appUser: { id: string } }>();
+  const archivedSessions = new Set<string>();
+  const rejectedSessions = new Set<string>();
   const artifactWrites: any[] = [];
   const comments: any[] = [];
   const relations: any[] = [];
@@ -79,6 +82,9 @@ async function fixture(t: TestContext) {
       if (query.includes("BridgeCurrentSession")) {
         res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { agentSessions: { nodes: [...linearSessions.values()].filter(s => s.issueId === variables.id), pageInfo: { hasNextPage: false } } } } })); return;
       }
+      if (query.includes("BridgeDeliverySessions")) {
+        res.end(JSON.stringify({ data: { issue: { agentSessions: { nodes: [...linearSessions.values()].filter(s => s.issueId === variables.id).map(s => ({ id: s.id, archivedAt: archivedSessions.has(s.id) ? "2026-09-16T16:42:05Z" : null })), pageInfo: { hasNextPage: false } } } } })); return;
+      }
       if (/mutation BridgeArtifact/.test(query)) {
         artifactWrites.push({ query, variables });
         const input = variables.input;
@@ -101,11 +107,13 @@ async function fixture(t: TestContext) {
       }
       if (query.includes("AgentActivityCreate")) {
         if (faults.linearDown) { res.statusCode = 503; res.end('{}'); return; }
+        if (archivedSessions.has(variables.input.agentSessionId) || rejectedSessions.has(variables.input.agentSessionId)) { res.end(JSON.stringify({ errors: [{ message: "Entity not found: AgentSession", path: ["agentActivityCreate"] }] })); return; }
         if (!activities.some(a => a.id === variables.input.id)) activities.push(variables.input);
         if (faults.dropActivity) { faults.dropActivity = false; res.destroy(); return; }
         res.end(JSON.stringify({ data: { agentActivityCreate: { success: true, agentActivity: { id: variables.input.id } } } }));
       } else if (query.includes("BridgeActivity")) {
         if (faults.linearDown) { res.statusCode = 503; res.end('{}'); return; }
+        if (archivedSessions.has(variables.sessionId) || rejectedSessions.has(variables.sessionId)) { res.end(JSON.stringify({ errors: [{ message: "Entity not found: AgentSession", path: ["agentSession"] }] })); return; }
         res.end(JSON.stringify({ data: { agentSession: { activities: { nodes: activities.filter(a => a.id === variables.id).map(a => ({ id: a.id })) } } } }));
       } else if (query.includes("BridgeProjectConfig")) {
         res.end(JSON.stringify({ data: { project: { content: projectDocument.content ?? "Project prose\n\n```yaml\n" + stringify(projectConfig) + "```" } } }));
@@ -224,7 +232,7 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify({ type: "AgentSessionEvent", webhookTimestamp: Date.now(), ...payload });
     return fetch(url + "/linear/webhook", { method: "POST", headers: { "content-type": "application/json", "linear-signature": signature ? createHmac("sha256", "webhook-secret").update(body).digest("hex") : "bad" }, body });
   };
-  return { linearSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
+  return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
     holdIssueRead: (remaining: number) => {
       let release!: () => void;
       let entered!: () => void;
@@ -238,6 +246,36 @@ async function fixture(t: TestContext) {
   };
 }
 const delegation = (session = "session-1") => ({ action: "created", organizationId: "workspace-1", agentSession: { id: session, issue: { id: session === "session-1" ? "issue-1" : `issue-${session}` } } });
+
+test("archived Linear sessions retain undelivered updates without blocking live sessions", async t => {
+  const f = await fixture(t);
+  f.options.concurrency = 2;
+  f.archivedSessions.add("session-1");
+  await f.send(delegation());
+  await f.send(delegation("session-2"));
+  await f.tick(4);
+  assert.ok(f.activities.some(activity => activity.agentSessionId === "session-2"));
+  const db = new DatabaseSync(path.join(f.root, "bridge.sqlite"), { readOnly: true });
+  const state = JSON.parse(String(db.prepare("SELECT body FROM bridge_state WHERE id=1").get()!.body));
+  db.close();
+  assert.ok(state.undeliverable.some((entry: { sessionId: string }) => entry.sessionId === "session-1"));
+  assert.ok(!state.outbox.some((entry: { sessionId: string }) => entry.sessionId === "session-1"));
+});
+
+test("unverified delivery failures retain order and allow other sessions to deliver", async t => {
+  const f = await fixture(t);
+  f.options.concurrency = 2;
+  f.rejectedSessions.add("session-1");
+  await f.send(delegation());
+  await f.send(delegation("session-2"));
+  await f.tick(4);
+  assert.ok(f.activities.some(activity => activity.agentSessionId === "session-2"));
+  const db = new DatabaseSync(path.join(f.root, "bridge.sqlite"), { readOnly: true });
+  const state = JSON.parse(String(db.prepare("SELECT body FROM bridge_state WHERE id=1").get()!.body));
+  db.close();
+  assert.ok(state.outbox.some((entry: { sessionId: string }) => entry.sessionId === "session-1"));
+  assert.ok(!state.undeliverable?.some((entry: { sessionId: string }) => entry.sessionId === "session-1"));
+});
 
 test("signed delegation creates one isolated configured T3Code turn and reports intake", async t => {
   const f = await fixture(t);
