@@ -1393,6 +1393,30 @@ test("custom status prompts and optional skills are independent of output contra
   assert.ok(f.activities.some(a => a.content.type === "response" && /Design reviewed/.test(a.content.body)));
 });
 
+test("agent-managed workflow follows its status prompt without bridge publication", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.implement = {
+    output: "agent-managed", prompt: "Save the review report in Linear, ask for the handoff decision, then apply it after the answer.",
+  };
+  await f.send(delegation()); await f.tick();
+  const turn = f.commands.find(c => c.type === "thread.turn.start");
+  assert.match(turn.message.text, /Save the review report in Linear/);
+  assert.doesNotMatch(turn.message.text, /Never advance statuses|Return publication content|<bridge-result>/);
+  const thread = f.threads.get(turn.threadId);
+  thread.activities.push({ id: "handoff-question", kind: "user-input.requested", tone: "info", summary: "Choose handoff", turnId: thread.latestTurn.turnId, payload: { requestId: "handoff", questions: [{ id: "decision", question: "Where next?", options: [{ label: "Back to Implementation" }, { label: "Forward to UAT" }] }] } });
+  await f.tick();
+  assert.ok(f.activities.some(a => a.content.type === "elicitation" && /Back to Implementation/.test(a.content.body) && /Forward to UAT/.test(a.content.body)));
+  await f.send(followup("handoff-answer", "Back to Implementation")); await f.tick();
+  assert.ok(f.commands.some(c => c.type === "thread.user-input.respond" && c.requestId === "handoff"));
+  thread.latestTurn.state = "completed";
+  thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: "review-complete", role: "assistant", turnId: thread.latestTurn.turnId, text: "Review report saved; awaiting the user's handoff decision in Linear." });
+  await f.tick();
+  assert.equal(f.comments.length, 0);
+  assert.ok(f.activities.some(a => a.content.type === "response" && /Review report saved/.test(a.content.body)));
+  assert.ok(!f.activities.some(a => a.content.type === "error" && /validation\/context report/.test(a.content.body)));
+});
+
 test("new-thread applies on re-entry but never on follow-ups or restart", async t => {
   const f = await fixture(t);
   f.projectConfig.t3code.workflows[0].statuses.implement = { output: "comment", "new-thread": true, prompt: "Review this issue." };

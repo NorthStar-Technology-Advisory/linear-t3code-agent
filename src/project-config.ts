@@ -3,7 +3,7 @@ import { IntegrationError } from "./t3code-runner.js";
 import { z } from "zod";
 import type { ProjectQuery } from "./project-routing.js";
 
-export const OutputSchema = z.enum(["comment", "specification", "tickets", "draft-pr"]);
+export const OutputSchema = z.enum(["comment", "specification", "tickets", "draft-pr", "agent-managed"]);
 const StatusSchema = z.object({
   prompt: z.string().refine(value => value.trim().length > 0, "Prompt must not be empty"),
   output: OutputSchema,

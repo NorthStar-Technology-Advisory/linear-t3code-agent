@@ -8,7 +8,7 @@ Consolidate project labels and team status-description markers into one versione
 
 Require exactly one fenced block with a top-level `t3code` mapping. Accept YAML, yml and unlabelled fences, with ordinary prose and unrelated code blocks surrounding it. Version 1 requires an exact active T3Code project title and team-specific status mappings. Resolve exact team keys among the Linear project's teams and exact status names within each team to unique IDs. Reject missing/ambiguous names, duplicate keys/teams/blocks, unsupported fields/versions/outputs, malformed YAML and aliases before execution.
 
-Each status requires a nonempty multiline-capable prompt and an output: `comment`, `specification`, `tickets` or `draft-pr`. `required-skills` defaults to an empty list and checks each named skill against the selected provider's workspace catalog. `new-thread` defaults to false. Optional project-wide `instructions` supplement each status prompt. Provider/model/workspace preferences continue to inherit from T3Code; service credentials, concurrency and polling remain instance settings.
+Each status requires a nonempty multiline-capable prompt and an output: `comment`, `specification`, `tickets`, `draft-pr` or `agent-managed`. `agent-managed` follows the status prompt for direct Linear publication and handoffs, without bridge artifact publication or a bridge-result block. `required-skills` defaults to an empty list and checks each named skill against the selected provider's workspace catalog. `new-thread` defaults to false. Optional project-wide `instructions` supplement each status prompt. Provider/model/workspace preferences continue to inherit from T3Code; service credentials, concurrency and polling remain instance settings.
 
 ## Execution
 

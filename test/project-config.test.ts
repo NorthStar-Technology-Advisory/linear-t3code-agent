@@ -42,6 +42,12 @@ test("duplicate team entries and missing required output are rejected", () => {
   assert.throws(() => parseProjectConfig(fence(config()).replace("        output: draft-pr\n", "")), /output/);
 });
 
+test("explicit agent-managed output accepts direct Linear workflow prompts", () => {
+  const input = config();
+  input.t3code.workflows[0].statuses.Todo.output = "agent-managed";
+  assert.equal(parseProjectConfig(fence(input)).workflows[0]!.statuses.Todo.output, "agent-managed");
+});
+
 test("resolves exact team/status names to IDs across paginated collections", async () => {
   const query = async <T>(text: string, variables?: Record<string, unknown>): Promise<T> => {
     if (text.includes("BridgeProjectConfig")) return { project: { content: fence(config()) } } as T;

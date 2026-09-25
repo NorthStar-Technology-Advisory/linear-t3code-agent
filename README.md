@@ -117,6 +117,7 @@ t3code:
 | `specification` | Publish a reviewable specification in the parent issue description |
 | `tickets` | Publish an approved breakdown of native Linear children with acceptance criteria and blocking links |
 | `draft-pr` | Report passing validation and verify an open draft GitHub PR |
+| `agent-managed` | Follow the status prompt to publish directly in Linear, ask native questions and apply its authorized handoffs; no bridge-result block or bridge artifact publication |
 
 Prompts select how work is performed; `output` selects what the bridge validates and publishes. Outputs do not implicitly invoke a particular skill. List any prerequisites in `required-skills` and invoke them in the prompt (for example, `Use $implement`). Install and maintain these skills in the selected provider's T3Code execution environment. Missing, disabled, non-user-invocable or ambiguous skills block execution. The bridge does not install skills, and required human reviews remain in effect. Repository/provider/model/workspace and service credentials are not configurable through prompts.
 

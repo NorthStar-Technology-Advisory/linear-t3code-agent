@@ -716,6 +716,17 @@ export class Bridge {
         this.store.update(s => { s.sessions[id].active!.turnId = latest.turnId; s.sessions[id].sequence = snapshot.sequence; });
         if (latest.state !== "running") {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
+          if (session.stage!.output === "agent-managed") {
+            const readable = summary.replace(/<bridge-result>[\s\S]*?<\/bridge-result>/g, "").trim();
+            const excerpt = readable.length > 2_000 ? `${readable.slice(0, 2_000)}\n\nFull response is in the T3Code thread.` : readable;
+            this.store.update(s => {
+              const current = s.sessions[id];
+              delete current.active; delete current.command;
+              current.status = latest.state === "completed" && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
+              this.report(s, current, latest.state === "completed" ? "response" : "error", excerpt || `T3Code turn ${latest.state}.`);
+            });
+            return;
+          }
           const planning = session.stage!.output !== "draft-pr";
           const result = deliveryResult(summary, session.stage!.output);
           if (planning && result.complete && latest.state === "completed") {
