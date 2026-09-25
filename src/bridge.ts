@@ -9,6 +9,7 @@ import { z } from "zod";
 import { BridgeStore } from "./bridge-store.js";
 import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient, type IssueRevision } from "./linear-context.js";
+import { LinearRateLimitError } from "./linear.js";
 import { prepareCheckout, ticketBranch, git, type Route } from "./repository.js";
 import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
@@ -33,7 +34,7 @@ type Session = {
   publicationPreparationBlocked?: boolean;
   publication?: Publication; publicationHistory?: Publication[]; artifacts?: ArtifactIdentities;
   stage?: Stage; previousThreads?: SavedThread[];
-  gate?: string; gateRevision?: number; gateDirty?: boolean; transition?: boolean; retiredRequests?: string[];
+  gate?: string; gateRevision?: number; gateDirty?: boolean; lastGateCheckAt?: number; nextStepAt?: number; transition?: boolean; retiredRequests?: string[];
   threadId: string; branch: string; worktree: string | null; route?: Route;
   status: "queued" | "running" | "paused" | "cancelled" | "cancelling" | "idle" | "closed";
   queue: QueuedTurn[]; command?: RunnerCommand;
@@ -297,6 +298,7 @@ export class Bridge {
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];
     for (const session of Object.values(this.store.read().sessions)) {
+      if (session.status !== "cancelling" && (session.nextStepAt ?? 0) > Date.now()) continue;
       if (session.status !== "closed" && session.gateDirty || session.status === "running" || session.status === "cancelling" || (session.status === "paused" && session.active)) eligible.push(session.id);
       else if (session.status === "queued" && (session.active || running < this.options.concurrency)) {
         this.store.update(s => { s.sessions[session.id].status = "running"; });
@@ -304,7 +306,10 @@ export class Bridge {
       } else if (session.pr && session.status !== "closed" && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) eligible.push(session.id);
     }
     await Promise.all(eligible.map(async id => {
-      try { await this.step(id); }
+      try {
+        await this.step(id);
+        if (this.session(id).nextStepAt) this.store.update(state => { delete state.sessions[id].nextStepAt; });
+      }
       catch (error) {
         const message = redact(error instanceof Error ? error.message : "Bridge operation failed.");
         this.store.update(state => {
@@ -312,6 +317,7 @@ export class Bridge {
           const changed = session.lastError !== message;
           if (changed) this.report(state, session, "error", message);
           session.lastError = message;
+          if (error instanceof LinearRateLimitError) session.nextStepAt = Date.now() + 60_000;
           if (error instanceof IntegrationError && !error.retryable && session.status !== "cancelling") {
             if (session.status !== "paused" || changed) this.report(state, session, "error", "Integration requires attention. Work is preserved and paused; repair the configuration or adapter, then send resume.");
             if (session.publication) session.publication.blocked = true;
@@ -626,6 +632,14 @@ export class Bridge {
     const generation = session.generation;
     const gateRevision = session.gateRevision ?? 0;
     const stillCurrent = () => this.session(id).generation === generation && (this.session(id).gateRevision ?? 0) === gateRevision;
+    // Webhooks invalidate the gate immediately. During an unchanged active turn,
+    // keep observing T3Code without rereading Linear on every one-second tick.
+    const reuseGate = Boolean(session.active && session.stage && session.route && session.created && session.gate &&
+      !session.gateDirty && !session.command && !session.responses.length && !session.publication &&
+      Date.now() - (session.lastGateCheckAt ?? 0) < 60_000);
+    let gateIssue!: Awaited<ReturnType<LinearClient["issue"]>>;
+    let gate = session.gate ?? "";
+    if (!reuseGate) {
     const owner = await this.options.linear.currentSession(session.issueId);
     if (!stillCurrent()) return;
     this.store.update(state => {
@@ -650,10 +664,10 @@ export class Bridge {
       });
       session = this.session(id);
     }
-    const gateIssue = await this.options.linear.issue(session.issueId);
+    gateIssue = await this.options.linear.issue(session.issueId);
     if (!stillCurrent()) return;
-    const gate = workflowGate(gateIssue);
-    this.store.update(s => { s.sessions[id].gateDirty = false; });
+    gate = workflowGate(gateIssue);
+    this.store.update(s => { s.sessions[id].gateDirty = false; s.sessions[id].lastGateCheckAt = Date.now(); });
     if ((session.gate !== undefined && session.gate !== gate) || (session.gate === undefined && session.created && !session.stage)) {
       if (session.stage?.output === "external-review") {
         this.store.update(s => {
@@ -771,6 +785,7 @@ export class Bridge {
           prompt: settings.prompt, instructions: projectConfig!.instructions, skills };
       });
       session = this.session(id);
+    }
     }
     if (!session.created) {
       try {

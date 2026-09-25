@@ -57,13 +57,14 @@ async function fixture(t: TestContext) {
   const issueOverrides: Record<string, any> = {};
   let heldIssueRead: { remaining: number; entered: () => void; wait: Promise<void> } | undefined;
   const reads: any[] = [];
+  const linearQueries: string[] = [];
   const linearSessions = new Map<string, { id: string; issueId: string; createdAt: string; appUser: { id: string } }>();
   const archivedSessions = new Set<string>();
   const rejectedSessions = new Set<string>();
   const artifactWrites: any[] = [];
   const comments: any[] = [];
   const relations: any[] = [];
-  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "" };
+  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -76,6 +77,11 @@ async function fixture(t: TestContext) {
     if (req.url === "/graphql") {
       assert.equal(req.headers.authorization, "Bearer linear-secret");
       const { query, variables } = JSON.parse(raw);
+      linearQueries.push(query);
+      if (query.includes("BridgeIssue") && faults.rateLimitIssueReads) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }] })); return;
+      }
       if (query.includes("BridgeIssue") && heldIssueRead && --heldIssueRead.remaining === 0) {
         const held = heldIssueRead; heldIssueRead = undefined;
         held.entered(); await held.wait;
@@ -258,7 +264,7 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify(payload);
     return fetch(url + "/github/webhook", { method: "POST", headers: { "content-type": "application/json", "x-github-event": eventType, "x-github-delivery": deliveryId, "x-hub-signature-256": signature ? `sha256=${createHmac("sha256", "github-webhook-secret").update(body).digest("hex")}` : "sha256=bad" }, body });
   };
-  return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, sendGithub, issueOverrides, reads, pr, faults, options,
+  return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, sendGithub, issueOverrides, reads, linearQueries, pr, faults, options,
     holdIssueRead: (remaining: number) => {
       let release!: () => void;
       let entered!: () => void;
@@ -272,6 +278,27 @@ async function fixture(t: TestContext) {
   };
 }
 const delegation = (session = "session-1") => ({ action: "created", organizationId: "workspace-1", agentSession: { id: session, issue: { id: session === "session-1" ? "issue-1" : `issue-${session}` } } });
+
+test("an active turn reuses its verified Linear gate between webhook changes", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  assert.ok(f.commands.some(c => c.type === "thread.turn.start"));
+  const gateReads = () => f.linearQueries.filter(query => query.includes("BridgeCurrentSession") || query.includes("BridgeIssue")).length;
+  const before = gateReads();
+  await f.tick(5);
+  assert.equal(gateReads(), before);
+  await f.send({ type: "Issue", action: "update", organizationId: "workspace-1",
+    data: { id: "issue-1", updatedAt: "2026-09-25T20:00:00Z" }, updatedFrom: { stateId: "previous" } });
+  await f.tick(1);
+  assert.ok(gateReads() > before);
+});
+
+test("a Linear rate limit backs off preflight instead of retrying every tick", async t => {
+  const f = await fixture(t);
+  f.faults.rateLimitIssueReads = true;
+  await f.send(delegation()); await f.tick(5);
+  assert.equal(f.linearQueries.filter(query => query.includes("BridgeIssue")).length, 1);
+});
 
 test("signed CodeRabbit review moves a current PR back to implementation once", async t => {
   const f = await fixture(t);

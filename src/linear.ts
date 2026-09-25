@@ -26,8 +26,12 @@ type LinearTokenResponse = {
 
 type GraphqlResponse<T> = {
   data?: T;
-  errors?: Array<{ message: string; path?: Array<string | number> }>;
+  errors?: Array<{ message: string; path?: Array<string | number>; extensions?: { code?: string } }>;
 };
+
+export class LinearRateLimitError extends Error {
+  constructor() { super("Linear API rate limit reached; retrying after cooldown."); }
+}
 
 export type AgentActivityContent =
   | { type: "thought"; body: string }
@@ -149,6 +153,7 @@ export async function linearGraphql<T>(query: string, variables?: Record<string,
 
   const json = (await response.json()) as GraphqlResponse<T>;
 
+  if (json.errors?.some(error => error.extensions?.code === "RATELIMITED")) throw new LinearRateLimitError();
   if (!response.ok || json.errors?.length) {
     throw new Error(`Linear GraphQL failed (HTTP ${response.status}); check credentials, scopes, access and the current schema.`);
   }
