@@ -328,7 +328,7 @@ export class Bridge {
         if (!issue.delegated || issue.state.name !== "Ready for review" || !issue.project?.id) {
           // The PR review may precede the final Linear status update.
           const targetName = event.review.state === "approved" ? "Ready for UAT" : "Ready for implementation";
-          if (event.handoffIssued && issue.state.name === targetName || issue.state.name !== "Ready for implementation") this.dropGitHubReview(event);
+          if ((event.handoffIssued && issue.state.name === targetName) || issue.state.name !== "Ready for implementation") this.dropGitHubReview(event);
           else this.reviewRetryAt.set(event.review.id, Date.now() + this.options.prPollMs);
           continue;
         }
@@ -345,7 +345,14 @@ export class Bridge {
         await this.options.linear.comment(issue.id, note, commentId);
         const fresh = await this.options.linear.issue(issue.id);
         const latest = await this.options.githubReviews.verify(event);
-        if (fresh.state.id !== issue.state.id || !fresh.delegated || latest.head !== pr.head || !latest.open || (event.review.state === "approved" && !latest.checksPassing)) continue;
+        if (fresh.state.id !== issue.state.id || !fresh.delegated || latest.head !== pr.head || !latest.open) {
+          this.dropGitHubReview(event);
+          continue;
+        }
+        if (event.review.state === "approved" && !latest.checksPassing) {
+          this.reviewRetryAt.set(event.review.id, Date.now() + this.options.prPollMs);
+          continue;
+        }
         this.store.update(state => { const queued = state.githubReviews?.find(item => item.review.id === event.review.id); if (queued) queued.handoffIssued = true; });
         await this.options.linear.updateReviewHandoff(issue.id, stateId, event.review.state === "approved");
         const saved = await this.options.linear.issue(issue.id);
