@@ -107,11 +107,15 @@ async function fixture(t: TestContext) {
         res.end(JSON.stringify({ data: { issue: { comments: { nodes: comments.filter(c => c.id === variables.commentId) } } } })); return;
       }
       if (query.includes("BridgeReviewStatus")) {
-        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }] } } } })); return;
+        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }, { id: "done", name: "Done" }] } } } })); return;
       }
       if (query.includes("BridgeReviewHandoff")) {
         const input = variables.input;
         issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: input.stateId, name: input.stateId === "uat" ? "Ready for UAT" : "Ready for implementation", team: { id: "team-1" }, type: "started" }, ...(Object.hasOwn(input, "delegateId") ? { delegate: null } : {}) };
+        res.end(JSON.stringify({ data: { issueUpdate: { success: true } } })); return;
+      }
+      if (query.includes("BridgeMergedIssueUpdate")) {
+        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: "done", name: "Done", team: { id: "team-1" }, type: "completed" }, delegate: null };
         res.end(JSON.stringify({ data: { issueUpdate: { success: true } } })); return;
       }
       if (query.includes("AgentActivityCreate")) {
@@ -226,7 +230,8 @@ async function fixture(t: TestContext) {
   const options = {
     databasePath: path.join(root, "bridge.sqlite"), worktreeRoot: path.join(root, "worktrees"),
     pullRequests: { find: async (_route: unknown, branch: string): Promise<PullRequest | null> => ({ ...pr, headRefName: branch }) },
-    githubReviews: { verify: async (event: any) => ({ url: event.pull_request.html_url, branch: event.pull_request.head.ref, head: event.review.commit_id, open: true, checksPassing: true }) },
+    githubReviews: { verify: async (event: any) => ({ url: event.pull_request.html_url, branch: event.pull_request.head.ref, head: event.review.commit_id, open: true, checksPassing: true }),
+      verifyMerge: async (event: any) => ({ url: event.pull_request.html_url, branch: event.pull_request.head.ref, merged: true }) },
     prPollMs: 0,
     concurrency: 1, runner: new T3CodeRunner(externalUrl, "t3-secret"),
     linear: new LinearClient(externalUrl + "/graphql", tokenPath, async (input, init) => { attachmentRequests.push(String(input)); return fetch(externalUrl + "/attachment", init); }),
@@ -242,9 +247,9 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify({ type: "AgentSessionEvent", webhookTimestamp: Date.now(), ...payload });
     return fetch(url + "/linear/webhook", { method: "POST", headers: { "content-type": "application/json", "linear-signature": signature ? createHmac("sha256", "webhook-secret").update(body).digest("hex") : "bad" }, body });
   };
-  const sendGithub = async (payload: object, signature = true, deliveryId = "11111111-1111-4111-8111-111111111111") => {
+  const sendGithub = async (payload: object, signature = true, deliveryId = "11111111-1111-4111-8111-111111111111", eventType = "pull_request_review") => {
     const body = JSON.stringify(payload);
-    return fetch(url + "/github/webhook", { method: "POST", headers: { "content-type": "application/json", "x-github-event": "pull_request_review", "x-github-delivery": deliveryId, "x-hub-signature-256": signature ? `sha256=${createHmac("sha256", "github-webhook-secret").update(body).digest("hex")}` : "sha256=bad" }, body });
+    return fetch(url + "/github/webhook", { method: "POST", headers: { "content-type": "application/json", "x-github-event": eventType, "x-github-delivery": deliveryId, "x-hub-signature-256": signature ? `sha256=${createHmac("sha256", "github-webhook-secret").update(body).digest("hex")}` : "sha256=bad" }, body });
   };
   return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, sendGithub, issueOverrides, reads, pr, faults, options,
     holdIssueRead: (remaining: number) => {
@@ -304,6 +309,54 @@ test("CodeRabbit review for an older PR head cannot change the Linear issue", as
   await f.sendGithub(event, true, "33333333-3333-4333-8333-333333333333"); await f.tick();
   assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for review");
   assert.equal(f.comments.length, 0);
+});
+
+test("merged PR marks its saved Linear issue Done after the agent session closes", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  finish(f); await f.tick();
+  f.issueOverrides["issue-1"] = { state: { id: "uat", name: "Ready for UAT", team: { id: "team-1" }, type: "started" }, delegate: null };
+  f.pr.state = "MERGED";
+  await f.tick();
+  const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: branch } } };
+  assert.equal((await f.sendGithub(event, false, "44444444-4444-4444-8444-444444444444", "pull_request")).status, 401);
+  const response = await f.sendGithub(event, true, "44444444-4444-4444-8444-444444444444", "pull_request");
+  assert.deepEqual(await response.json(), { ok: true, accepted: true });
+  await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["issue-1"].delegate, null);
+  await f.sendGithub(event, true, "44444444-4444-4444-8444-444444444444", "pull_request"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+});
+
+test("closed but unmerged PR does not mark its Linear issue Done", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: false, head: { ref: branch } } };
+  const response = await f.sendGithub(event, true, "55555555-5555-4555-8555-555555555555", "pull_request");
+  assert.deepEqual(await response.json(), { ok: true, accepted: false });
+  await f.tick();
+  assert.equal(f.issueOverrides["issue-1"]?.state?.name, undefined);
+});
+
+test("merged PR handoff waits for GitHub verification and survives a bridge restart", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  f.pr.state = "MERGED";
+  const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: branch } } };
+  f.options.githubReviews.verifyMerge = async () => ({ url: f.pr.url, branch, merged: false });
+  await f.sendGithub(event, true, "66666666-6666-4666-8666-666666666666", "pull_request"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"]?.state?.name, undefined);
+  await f.restart();
+  f.options.githubReviews.verifyMerge = async () => ({ url: f.pr.url, branch, merged: true });
+  await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
 });
 
 test("archived Linear sessions retain undelivered updates without blocking live sessions", async t => {

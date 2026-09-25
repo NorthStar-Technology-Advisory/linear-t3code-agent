@@ -14,7 +14,7 @@ import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
-import { GitHubReviewSchema, type GitHubReview, type GitHubReviews } from "./github-review.js";
+import { GitHubReviewSchema, GitHubMergeSchema, type GitHubReview, type GitHubMerge, type GitHubReviews } from "./github-review.js";
 import { createHash } from "node:crypto";
 
 const WebhookSchema = z.object({
@@ -48,7 +48,7 @@ type Session = {
 type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
 type Undeliverable = Outbound & { failedAt: string; reason: "session archived" };
 type QueuedGitHubReview = GitHubReview & { handoffIssued?: boolean };
-type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[] };
+type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[]; githubMerges?: GitHubMerge[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
   pullRequests: PullRequests; prPollMs: number;
@@ -61,6 +61,7 @@ export class Bridge {
   private readonly store: BridgeStore<State>;
   private readonly deliveryRetryAt = new Map<string, number>();
   private readonly reviewRetryAt = new Map<number, number>();
+  private readonly mergeRetryAt = new Map<string, number>();
   private ticking?: Promise<void>;
   private timer?: NodeJS.Timeout;
   constructor(private readonly options: BridgeOptions) {
@@ -79,6 +80,19 @@ export class Bridge {
       if (!Object.values(state.sessions).some(session => session.branch === event.pull_request.head.ref && !session.supersededBy && session.status !== "closed")) return false;
       state.deliveries.push(key);
       (state.githubReviews ??= []).push(event);
+      return true;
+    });
+  }
+  acceptGitHubMerge(input: unknown, deliveryId: string): boolean {
+    const parsed = GitHubMergeSchema.safeParse(input);
+    if (!parsed.success) return false;
+    const event = parsed.data;
+    return this.store.update(state => {
+      const key = `github:${deliveryId}`;
+      if (state.deliveries.includes(key)) return true;
+      if (!Object.values(state.sessions).some(session => session.branch === event.pull_request.head.ref && session.route)) return false;
+      state.deliveries.push(key);
+      (state.githubMerges ??= []).push(event);
       return true;
     });
   }
@@ -246,6 +260,7 @@ export class Bridge {
     return this.ticking;
   }
   private async work() {
+    await this.processGitHubMerges();
     await this.processGitHubReviews();
     const failedSessions = new Set<string>();
     for (const outgoing of this.store.read().outbox) {
@@ -305,6 +320,39 @@ export class Bridge {
         });
       }
     }));
+  }
+  private async processGitHubMerges() {
+    if (!this.options.githubReviews) return;
+    for (const event of this.store.read().githubMerges ?? []) {
+      const key = `${event.repository.full_name}:${event.pull_request.number}`;
+      if ((this.mergeRetryAt.get(key) ?? 0) > Date.now()) continue;
+      try {
+        const candidates = Object.values(this.store.read().sessions).filter(s => s.branch === event.pull_request.head.ref && s.route);
+        const matches: Session[] = [];
+        for (const candidate of candidates) {
+          const pr = await this.options.pullRequests.find(candidate.route!, candidate.branch);
+          if (pr?.url === event.pull_request.html_url && pr.number === event.pull_request.number && pr.state === "MERGED") matches.push(candidate);
+        }
+        if (new Set(matches.map(s => s.issueId)).size !== 1 || !matches.length) throw new Error("Merged PR does not map to one saved Linear issue.");
+        const verified = await this.options.githubReviews.verifyMerge(event);
+        if (!verified.merged || verified.url !== event.pull_request.html_url || verified.branch !== event.pull_request.head.ref) throw new Error("GitHub has not verified this PR as merged.");
+        const session = matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]!;
+        const issue = await this.options.linear.issue(session.issueId);
+        if (issue.state.name === "Done") { this.dropGitHubMerge(event); continue; }
+        const doneId = await this.options.linear.statusId(issue.team.id, "Done");
+        await this.options.linear.updateMergedIssue(issue.id, doneId);
+        const saved = await this.options.linear.issue(issue.id);
+        if (saved.state.id !== doneId || saved.delegate) throw new Error("Merged PR status update could not be verified in Linear.");
+        this.dropGitHubMerge(event);
+      } catch (error) {
+        this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
+        console.error("GitHub merge handoff retained for retry", { pullRequest: event.pull_request.html_url, message: redact(error instanceof Error ? error.message : String(error)) });
+      }
+    }
+  }
+  private dropGitHubMerge(event: GitHubMerge) {
+    this.mergeRetryAt.delete(`${event.repository.full_name}:${event.pull_request.number}`);
+    this.store.update(state => { state.githubMerges = (state.githubMerges ?? []).filter(item => !(item.repository.full_name === event.repository.full_name && item.pull_request.number === event.pull_request.number)); });
   }
   private async processGitHubReviews() {
     if (!this.options.githubReviews) return;

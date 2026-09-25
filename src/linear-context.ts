@@ -74,6 +74,12 @@ export class LinearClient {
       `mutation BridgeReviewHandoff($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`, { id: issueId, input });
     if (!data.issueUpdate.success) throw new Error("Linear review handoff was not saved.");
   }
+  async updateMergedIssue(issueId: string, doneStateId: string): Promise<void> {
+    const data = await this.query<{ issueUpdate: { success: boolean } }>(
+      `mutation BridgeMergedIssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+      { id: issueId, input: { stateId: doneStateId, delegateId: null } });
+    if (!data.issueUpdate.success) throw new Error("Linear issue was not marked Done after PR merge.");
+  }
   private async connection<T>(id: string, field: keyof typeof fields): Promise<T[]> {
     const nodes: T[] = [];
     let after: string | undefined;

@@ -200,16 +200,16 @@ Expose `/linear/webhook`, `/linear/oauth/callback`, and the protected `/linear/i
 
 ### CodeRabbit GitHub webhook
 
-Set `GITHUB_WEBHOOK_SECRET` in the private `.env` file to a random secret of at least 16 characters and restart the bridge. In each GitHub repository that holds T3Code PRs, open **Settings → Webhooks → Add webhook** and enter:
+Set `GITHUB_WEBHOOK_SECRET` in the private `.env` file to a random secret of at least 16 characters and restart the bridge. In each GitHub repository that holds T3Code PRs, open **Settings → Webhooks → Add webhook** (or edit the existing bridge webhook) and enter:
 
 - Payload URL: `<BASE_URL>/github/webhook`
 - Content type: `application/json`
 - Secret: the same `GITHUB_WEBHOOK_SECRET`
 - SSL verification: enabled
-- Events: **Let me select individual events → Pull request reviews**
+- Events: **Let me select individual events → Pull requests and Pull request reviews**
 - Active: enabled
 
-The webhook accepts only signed, submitted reviews by `coderabbitai[bot]` that map to a current ticket branch and PR. It verifies the review and current PR head through the authenticated `gh` CLI. A changes-requested review saves a Linear comment and moves **Ready for review → Ready for implementation**, retaining delegation. An approval waits for all reported GitHub checks to pass, then saves the outcome and moves **Ready for review → Ready for UAT** while clearing delegation. Pending, failed, stale, or unmatched reviews do not advance the issue. Deliveries and pending handoffs survive restarts. Keep CodeRabbit's Request Changes Workflow and automatic review of PRs enabled. Its default automatic review skips draft PRs, so the implementation prompt must open a PR ready for review (or CodeRabbit must have `reviews.auto_review.drafts: true`). Replace the T3Code review-stage prompt with a wait-for-CodeRabbit prompt before enabling this webhook to avoid concurrent review decisions. No PR is merged by the bridge.
+The webhook accepts only signed, submitted reviews by `coderabbitai[bot]` that map to a current ticket branch and PR. It verifies the review and current PR head through the authenticated `gh` CLI. A changes-requested review saves a Linear comment and moves **Ready for review → Ready for implementation**, retaining delegation. An approval waits for all reported GitHub checks to pass, then saves the outcome and moves **Ready for review → Ready for UAT** while clearing delegation. Pending, failed, stale, or unmatched reviews do not advance the issue. A signed PR-closed event with `merged: true` is checked against GitHub and the saved ticket-PR association before the issue moves to **Done** and delegation is cleared; an ordinary closed PR does not complete the issue. Deliveries and pending handoffs survive restarts. Keep CodeRabbit's Request Changes Workflow and automatic review of PRs enabled. Its default automatic review skips draft PRs, so the implementation prompt must open a PR ready for review (or CodeRabbit must have `reviews.auto_review.drafts: true`). Replace the T3Code review-stage prompt with a wait-for-CodeRabbit prompt before enabling this webhook to avoid concurrent review decisions. No PR is merged by the bridge.
 
 Run `npm test` for the integrated controlled-service suite, `npm run typecheck`, and `npm run build`. `npm run smoke:webhook` checks signed intake without creating a session; `npm run smoke:linear` checks the installed Linear identity without posting activities.
 

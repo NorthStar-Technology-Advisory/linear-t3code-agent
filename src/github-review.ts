@@ -14,8 +14,16 @@ export const GitHubReviewSchema = z.object({
     html_url: z.string().url(), body: z.string().nullable().optional(), user: z.object({ login: z.string() }) }),
 });
 export type GitHubReview = z.infer<typeof GitHubReviewSchema>;
+export const GitHubMergeSchema = z.object({
+  action: z.literal("closed"),
+  repository: z.object({ full_name: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }),
+  pull_request: z.object({ number: z.number().int().positive(), html_url: z.string().url(), merged: z.literal(true),
+    head: z.object({ ref: z.string().min(1) }) }),
+});
+export type GitHubMerge = z.infer<typeof GitHubMergeSchema>;
 export type VerifiedPullRequest = { url: string; branch: string; head: string; open: boolean; checksPassing: boolean };
-export interface GitHubReviews { verify(event: GitHubReview): Promise<VerifiedPullRequest>; }
+export type VerifiedMerge = { url: string; branch: string; merged: boolean };
+export interface GitHubReviews { verify(event: GitHubReview): Promise<VerifiedPullRequest>; verifyMerge(event: GitHubMerge): Promise<VerifiedMerge>; }
 
 export function verifyGitHubSignature(header: string | undefined, body: Buffer): boolean {
   if (!config.GITHUB_WEBHOOK_SECRET || !header || !/^sha256=[0-9a-f]{64}$/i.test(header)) return false;
@@ -46,5 +54,11 @@ export class GitHubReviewClient implements GitHubReviews {
     return { url: pr.html_url, branch: pr.head.ref, head: pr.head.sha, open: pr.state === "open",
       checksPassing: (checks.statusCheckRollup ?? []).every(check =>
         ["SUCCESS", "NEUTRAL", "SKIPPED"].includes(check.conclusion ?? check.state ?? "")) };
+  }
+  async verifyMerge(event: GitHubMerge): Promise<VerifiedMerge> {
+    const pr = await gh<{ number: number; html_url: string; state: string; merged: boolean; merged_at: string | null; head: { ref: string } }>(
+      "api", `repos/${event.repository.full_name}/pulls/${event.pull_request.number}`);
+    if (pr.number !== event.pull_request.number || pr.html_url !== event.pull_request.html_url) throw new Error("GitHub PR identity changed.");
+    return { url: pr.html_url, branch: pr.head.ref, merged: pr.state === "closed" && pr.merged === true && Boolean(pr.merged_at) };
   }
 }

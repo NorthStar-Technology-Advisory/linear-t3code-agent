@@ -146,14 +146,15 @@ export function createApp(bridge?: Bridge) {
     if (!config.GITHUB_WEBHOOK_SECRET) return res.status(503).json({ ok: false, error: "github_webhook_not_configured" });
     const body = rawBody(req);
     if (!verifyGitHubSignature(req.get("x-hub-signature-256"), body)) return res.status(401).json({ ok: false, error: "invalid_signature" });
-    if (req.get("x-github-event") !== "pull_request_review") return res.json({ ok: true, accepted: false });
+    const eventType = req.get("x-github-event");
+    if (eventType !== "pull_request_review" && eventType !== "pull_request") return res.json({ ok: true, accepted: false });
     let payload: unknown;
     try { payload = parseJsonBody(body); }
     catch { return res.status(400).json({ ok: false, error: "invalid_json" }); }
     const deliveryId = req.get("x-github-delivery");
     if (!deliveryId || !/^[0-9a-f-]{36}$/i.test(deliveryId)) return res.status(400).json({ ok: false, error: "invalid_delivery_id" });
     if (!bridge) return res.status(503).json({ ok: false, error: "bridge_unavailable" });
-    try { return res.json({ ok: true, accepted: bridge.acceptGitHubReview(payload, deliveryId) }); }
+    try { return res.json({ ok: true, accepted: eventType === "pull_request" ? bridge.acceptGitHubMerge(payload, deliveryId) : bridge.acceptGitHubReview(payload, deliveryId) }); }
     catch { return res.status(503).json({ ok: false, error: "intake_failed" }); }
   });
 
