@@ -68,6 +68,23 @@ export class LinearClient {
     if (matches.length !== 1) throw new Error(`Expected one ${name} status on the issue team.`);
     return matches[0]!.id;
   }
+  async childIssueIds(issueId: string): Promise<string[]> {
+    const ids: string[] = [];
+    const cursors = new Set<string>();
+    let after: string | undefined;
+    do {
+      const data = await this.query<{ issue: { children: Connection<{ id: string }> } | null }>(
+        `query BridgeMergeChildren($id: String!, $after: String) { issue(id: $id) { children(first: 100, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } } } }`,
+        { id: issueId, after });
+      const connection = data.issue?.children;
+      if (!connection) throw new Error("Merged PR child issues are unavailable.");
+      ids.push(...connection.nodes.map(child => child.id));
+      if (!connection.pageInfo.hasNextPage) return ids;
+      after = connection.pageInfo.endCursor;
+      if (!after || cursors.has(after)) throw new Error("Merged PR child issue pagination did not advance.");
+      cursors.add(after);
+    } while (true);
+  }
   async updateReviewHandoff(issueId: string, stateId: string, clearDelegation: boolean): Promise<void> {
     const input = { stateId, ...(clearDelegation ? { delegateId: null } : {}) };
     const data = await this.query<{ issueUpdate: { success: boolean } }>(

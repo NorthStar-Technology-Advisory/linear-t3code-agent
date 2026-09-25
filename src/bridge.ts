@@ -338,11 +338,22 @@ export class Bridge {
         if (!verified.merged || verified.url !== event.pull_request.html_url || verified.branch !== event.pull_request.head.ref) throw new Error("GitHub has not verified this PR as merged.");
         const session = matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]!;
         const issue = await this.options.linear.issue(session.issueId);
-        if (issue.state.name === "Done") { this.dropGitHubMerge(event); continue; }
-        const doneId = await this.options.linear.statusId(issue.team.id, "Done");
-        await this.options.linear.updateMergedIssue(issue.id, doneId);
-        const saved = await this.options.linear.issue(issue.id);
-        if (saved.state.id !== doneId || saved.delegate) throw new Error("Merged PR status update could not be verified in Linear.");
+        const doneIds = new Map<string, string>();
+        const markDone = async (target: typeof issue) => {
+          let doneId = doneIds.get(target.team.id);
+          if (!doneId) {
+            doneId = await this.options.linear.statusId(target.team.id, "Done");
+            doneIds.set(target.team.id, doneId);
+          }
+          if (target.state.id !== doneId || target.delegate) await this.options.linear.updateMergedIssue(target.id, doneId);
+          const saved = await this.options.linear.issue(target.id);
+          if (saved.state.id !== doneId || saved.delegate) throw new Error(`Merged PR issue ${target.identifier} could not be verified as Done in Linear.`);
+        };
+        for (const childId of await this.options.linear.childIssueIds(issue.id)) {
+          const child = await this.options.linear.issue(childId);
+          if (child.parent?.id === issue.id) await markDone(child);
+        }
+        await markDone(issue);
         this.dropGitHubMerge(event);
       } catch (error) {
         this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
