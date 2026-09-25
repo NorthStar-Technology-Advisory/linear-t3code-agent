@@ -2,7 +2,7 @@
 
 A fork of [hiasinho/linear-pi-agent](https://github.com/hiasinho/linear-pi-agent), adapted to connect Linear Agent Sessions to an existing [T3Code](https://github.com/pingdotgg/t3code) environment.
 
-Delegate a Linear issue to the app and select its prompt and expected output using YAML in its project description. Grilling, specification and ticket creation share a planning conversation and publish artifacts in Linear. Implementation starts a fresh conversation, tests the work and delivers a draft GitHub PR. Humans review each output and move the issue to request the next stage. The bridge never advances statuses, delegates children or merges PRs.
+Delegate a Linear issue to the app and select its prompt and expected output using YAML in its project description. Grilling, specification and ticket creation share a planning conversation and publish artifacts in Linear. Implementation starts a fresh conversation, tests the work and delivers a GitHub PR. Humans review planning output and request the next stage. An optional CodeRabbit GitHub webhook can hand a review back to implementation or forward it to UAT. The bridge never delegates children or merges PRs.
 
 ## What changed from linear-pi-agent
 
@@ -197,6 +197,19 @@ On PR closure or merge, active execution is stopped first. Current-checkout sess
 | `HOST` / `PORT` | `127.0.0.1` / `8787` |
 
 Expose `/linear/webhook`, `/linear/oauth/callback`, and the protected `/linear/install` route. `/healthz` is an optional liveness check, not evidence of external integration readiness. Keep `.env`, SQLite/WAL files, context files and token stores private. Shut down the bridge before a filesystem backup, or use a SQLite-consistent backup of the database plus its context files. SIGTERM preserves remote execution for restart recovery; it does not cancel coding work.
+
+### CodeRabbit GitHub webhook
+
+Set `GITHUB_WEBHOOK_SECRET` in the private `.env` file to a random secret of at least 16 characters and restart the bridge. In each GitHub repository that holds T3Code PRs, open **Settings → Webhooks → Add webhook** and enter:
+
+- Payload URL: `<BASE_URL>/github/webhook`
+- Content type: `application/json`
+- Secret: the same `GITHUB_WEBHOOK_SECRET`
+- SSL verification: enabled
+- Events: **Let me select individual events → Pull request reviews**
+- Active: enabled
+
+The webhook accepts only signed, submitted reviews by `coderabbitai[bot]` that map to a current ticket branch and PR. It verifies the review and current PR head through the authenticated `gh` CLI. A changes-requested review saves a Linear comment and moves **Ready for review → Ready for implementation**, retaining delegation. An approval waits for all reported GitHub checks to pass, then saves the outcome and moves **Ready for review → Ready for UAT** while clearing delegation. Pending, failed, stale, or unmatched reviews do not advance the issue. Deliveries and pending handoffs survive restarts. Keep CodeRabbit's Request Changes Workflow and automatic review of PRs enabled. Its default automatic review skips draft PRs, so the implementation prompt must open a PR ready for review (or CodeRabbit must have `reviews.auto_review.drafts: true`). Replace the T3Code review-stage prompt with a wait-for-CodeRabbit prompt before enabling this webhook to avoid concurrent review decisions. No PR is merged by the bridge.
 
 Run `npm test` for the integrated controlled-service suite, `npm run typecheck`, and `npm run build`. `npm run smoke:webhook` checks signed intake without creating a session; `npm run smoke:linear` checks the installed Linear identity without posting activities.
 

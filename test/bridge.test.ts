@@ -15,6 +15,7 @@ Object.assign(process.env, {
   NODE_ENV: "test", DOTENV_CONFIG_PATH: "/dev/null",
   LINEAR_CLIENT_ID: "client", LINEAR_CLIENT_SECRET: "client-secret",
   LINEAR_WEBHOOK_SECRET: "webhook-secret", LINEAR_REDIRECT_URI: "https://example.com/linear/oauth/callback",
+  GITHUB_WEBHOOK_SECRET: "github-webhook-secret",
   BASE_URL: "https://example.com", T3CODE_URL: "http://127.0.0.1:3773",
   T3CODE_TOKEN: "t3-secret", T3CODE_PROVIDER: "codex", T3CODE_MODEL: "test-model",
   PROJECT_ROUTES: '{}',
@@ -104,6 +105,14 @@ async function fixture(t: TestContext) {
       }
       if (query.includes("BridgeArtifactComment")) {
         res.end(JSON.stringify({ data: { issue: { comments: { nodes: comments.filter(c => c.id === variables.commentId) } } } })); return;
+      }
+      if (query.includes("BridgeReviewStatus")) {
+        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }] } } } })); return;
+      }
+      if (query.includes("BridgeReviewHandoff")) {
+        const input = variables.input;
+        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: input.stateId, name: input.stateId === "uat" ? "Ready for UAT" : "Ready for implementation", team: { id: "team-1" }, type: "started" }, ...(Object.hasOwn(input, "delegateId") ? { delegate: null } : {}) };
+        res.end(JSON.stringify({ data: { issueUpdate: { success: true } } })); return;
       }
       if (query.includes("AgentActivityCreate")) {
         if (faults.linearDown) { res.statusCode = 503; res.end('{}'); return; }
@@ -217,6 +226,7 @@ async function fixture(t: TestContext) {
   const options = {
     databasePath: path.join(root, "bridge.sqlite"), worktreeRoot: path.join(root, "worktrees"),
     pullRequests: { find: async (_route: unknown, branch: string): Promise<PullRequest | null> => ({ ...pr, headRefName: branch }) },
+    githubReviews: { verify: async (event: any) => ({ url: event.pull_request.html_url, branch: event.pull_request.head.ref, head: event.review.commit_id, open: true, checksPassing: true }) },
     prPollMs: 0,
     concurrency: 1, runner: new T3CodeRunner(externalUrl, "t3-secret"),
     linear: new LinearClient(externalUrl + "/graphql", tokenPath, async (input, init) => { attachmentRequests.push(String(input)); return fetch(externalUrl + "/attachment", init); }),
@@ -232,7 +242,11 @@ async function fixture(t: TestContext) {
     const body = JSON.stringify({ type: "AgentSessionEvent", webhookTimestamp: Date.now(), ...payload });
     return fetch(url + "/linear/webhook", { method: "POST", headers: { "content-type": "application/json", "linear-signature": signature ? createHmac("sha256", "webhook-secret").update(body).digest("hex") : "bad" }, body });
   };
-  return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, issueOverrides, reads, pr, faults, options,
+  const sendGithub = async (payload: object, signature = true, deliveryId = "11111111-1111-4111-8111-111111111111") => {
+    const body = JSON.stringify(payload);
+    return fetch(url + "/github/webhook", { method: "POST", headers: { "content-type": "application/json", "x-github-event": "pull_request_review", "x-github-delivery": deliveryId, "x-hub-signature-256": signature ? `sha256=${createHmac("sha256", "github-webhook-secret").update(body).digest("hex")}` : "sha256=bad" }, body });
+  };
+  return { linearSessions, archivedSessions, rejectedSessions, artifactWrites, comments, relations, skills, projects, settings, providers, projectConfig, projectDocument, statusNodes, commands, activities, threads, events, attachmentRequests, repo, root, send, sendGithub, issueOverrides, reads, pr, faults, options,
     holdIssueRead: (remaining: number) => {
       let release!: () => void;
       let entered!: () => void;
@@ -246,6 +260,51 @@ async function fixture(t: TestContext) {
   };
 }
 const delegation = (session = "session-1") => ({ action: "created", organizationId: "workspace-1", agentSession: { id: session, issue: { id: session === "session-1" ? "issue-1" : `issue-${session}` } } });
+
+test("signed CodeRabbit review moves a current PR back to implementation once", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  f.issueOverrides["issue-1"] = { state: { id: "review", name: "Ready for review", team: { id: "team-1" }, type: "started" } };
+  const event = { action: "submitted", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, head: { ref: branch } }, review: { id: 101, state: "changes_requested", commit_id: "a".repeat(40), html_url: f.pr.url + "#pullrequestreview-101", body: "Fix the race", user: { login: "coderabbitai[bot]" } } };
+  assert.equal((await f.sendGithub(event, false)).status, 401);
+  assert.equal((await f.sendGithub(event)).status, 200);
+  await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for implementation");
+  assert.equal(f.comments.length, 1);
+  await f.sendGithub(event); await f.tick();
+  assert.equal(f.comments.length, 1);
+});
+
+test("CodeRabbit approval advances to UAT only for passing checks and clears delegation", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  f.issueOverrides["issue-1"] = { state: { id: "review", name: "Ready for review", team: { id: "team-1" }, type: "started" } };
+  const event = { action: "submitted", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, head: { ref: branch } }, review: { id: 102, state: "approved", commit_id: "b".repeat(40), html_url: f.pr.url + "#pullrequestreview-102", body: "Looks good", user: { login: "coderabbitai[bot]" } } };
+  f.options.githubReviews.verify = async () => ({ url: f.pr.url, branch, head: "b".repeat(40), open: true, checksPassing: false });
+  await f.sendGithub(event, true, "22222222-2222-4222-8222-222222222222"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for review");
+  f.options.githubReviews.verify = async () => ({ url: f.pr.url, branch, head: "b".repeat(40), open: true, checksPassing: true });
+  await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for UAT");
+  assert.equal(f.issueOverrides["issue-1"].delegate, null);
+});
+
+test("CodeRabbit review for an older PR head cannot change the Linear issue", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(c => c.type === "thread.create")?.branch;
+  assert.ok(branch);
+  f.issueOverrides["issue-1"] = { state: { id: "review", name: "Ready for review", team: { id: "team-1" }, type: "started" } };
+  const event = { action: "submitted", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, head: { ref: branch } }, review: { id: 103, state: "approved", commit_id: "c".repeat(40), html_url: f.pr.url, user: { login: "coderabbitai[bot]" } } };
+  f.options.githubReviews.verify = async () => ({ url: f.pr.url, branch, head: "d".repeat(40), open: true, checksPassing: true });
+  await f.sendGithub(event, true, "33333333-3333-4333-8333-333333333333"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for review");
+  assert.equal(f.comments.length, 0);
+});
 
 test("archived Linear sessions retain undelivered updates without blocking live sessions", async t => {
   const f = await fixture(t);

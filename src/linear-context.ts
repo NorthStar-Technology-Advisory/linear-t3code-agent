@@ -61,6 +61,19 @@ export class LinearClient {
   projectTitle(projectId: string | undefined): Promise<string> {
     return projectTitle((query, variables) => this.query(query, variables), projectId);
   }
+  async statusId(teamId: string, name: string): Promise<string> {
+    const data = await this.query<{ team: { states: { nodes: Array<{ id: string; name: string }> } } | null }>(
+      `query BridgeReviewStatus($id: String!) { team(id: $id) { states(first: 100) { nodes { id name } } } }`, { id: teamId });
+    const matches = data.team?.states.nodes.filter(state => state.name === name) ?? [];
+    if (matches.length !== 1) throw new Error(`Expected one ${name} status on the issue team.`);
+    return matches[0]!.id;
+  }
+  async updateReviewHandoff(issueId: string, stateId: string, clearDelegation: boolean): Promise<void> {
+    const input = { stateId, ...(clearDelegation ? { delegateId: null } : {}) };
+    const data = await this.query<{ issueUpdate: { success: boolean } }>(
+      `mutation BridgeReviewHandoff($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`, { id: issueId, input });
+    if (!data.issueUpdate.success) throw new Error("Linear review handoff was not saved.");
+  }
   private async connection<T>(id: string, field: keyof typeof fields): Promise<T[]> {
     const nodes: T[] = [];
     let after: string | undefined;

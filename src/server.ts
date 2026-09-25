@@ -8,6 +8,7 @@ import { T3CodeRunner } from "./t3code-runner.js";
 import { GitHubPullRequests } from "./pull-requests.js";
 import { redact } from "./progress.js";
 import { isFreshWebhookTimestamp, verifyLinearSignature } from "./signature.js";
+import { GitHubReviewClient, verifyGitHubSignature } from "./github-review.js";
 
 type LinearWebhookPayload = {
   type?: string;
@@ -141,6 +142,21 @@ export function createApp(bridge?: Bridge) {
     },
   );
 
+  app.post("/github/webhook", express.raw({ type: "application/json", limit: "1mb" }), (req: Request, res: Response) => {
+    if (!config.GITHUB_WEBHOOK_SECRET) return res.status(503).json({ ok: false, error: "github_webhook_not_configured" });
+    const body = rawBody(req);
+    if (!verifyGitHubSignature(req.get("x-hub-signature-256"), body)) return res.status(401).json({ ok: false, error: "invalid_signature" });
+    if (req.get("x-github-event") !== "pull_request_review") return res.json({ ok: true, accepted: false });
+    let payload: unknown;
+    try { payload = parseJsonBody(body); }
+    catch { return res.status(400).json({ ok: false, error: "invalid_json" }); }
+    const deliveryId = req.get("x-github-delivery");
+    if (!deliveryId || !/^[0-9a-f-]{36}$/i.test(deliveryId)) return res.status(400).json({ ok: false, error: "invalid_delivery_id" });
+    if (!bridge) return res.status(503).json({ ok: false, error: "bridge_unavailable" });
+    try { return res.json({ ok: true, accepted: bridge.acceptGitHubReview(payload, deliveryId) }); }
+    catch { return res.status(503).json({ ok: false, error: "intake_failed" }); }
+  });
+
   app.use((_req: Request, res: Response) => {
     res.status(404).json({ ok: false, error: "not_found" });
   });
@@ -158,7 +174,7 @@ if (process.env.NODE_ENV !== "test") {
   const bridge = new Bridge({
     databasePath: config.BRIDGE_DB_PATH, worktreeRoot: config.WORKTREE_ROOT,
     concurrency: config.MAX_CONCURRENT_SESSIONS, runner: new T3CodeRunner(config.T3CODE_URL, config.T3CODE_TOKEN),
-    linear: new LinearClient(), pullRequests: new GitHubPullRequests(), pollMs: config.POLL_INTERVAL_MS,
+    linear: new LinearClient(), pullRequests: new GitHubPullRequests(), githubReviews: new GitHubReviewClient(), pollMs: config.POLL_INTERVAL_MS,
     prPollMs: config.PR_POLL_INTERVAL_MS, heartbeatMs: config.PROGRESS_HEARTBEAT_MS, progressDebounceMs: config.PROGRESS_DEBOUNCE_MS,
   });
   const app = createApp(bridge);

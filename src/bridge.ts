@@ -14,6 +14,8 @@ import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
+import { GitHubReviewSchema, type GitHubReview, type GitHubReviews } from "./github-review.js";
+import { createHash } from "node:crypto";
 
 const WebhookSchema = z.object({
   action: z.enum(["created", "prompted"]), organizationId: z.string().min(1),
@@ -45,10 +47,12 @@ type Session = {
 };
 type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
 type Undeliverable = Outbound & { failedAt: string; reason: "session archived" };
-type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[] };
+type QueuedGitHubReview = GitHubReview & { handoffIssued?: boolean };
+type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
   pullRequests: PullRequests; prPollMs: number;
+  githubReviews?: GitHubReviews;
   concurrency: number; runner: Runner; linear: LinearClient;
   pollMs: number; heartbeatMs: number; progressDebounceMs: number;
 };
@@ -56,6 +60,7 @@ export type BridgeOptions = {
 export class Bridge {
   private readonly store: BridgeStore<State>;
   private readonly deliveryRetryAt = new Map<string, number>();
+  private readonly reviewRetryAt = new Map<number, number>();
   private ticking?: Promise<void>;
   private timer?: NodeJS.Timeout;
   constructor(private readonly options: BridgeOptions) {
@@ -63,6 +68,20 @@ export class Bridge {
   }
   start() { this.timer ??= setInterval(() => { void this.tick().catch(() => console.error("bridge tick failed; check durable storage")); }, this.options.pollMs); }
   async close() { clearInterval(this.timer); await this.ticking; this.store.close(); }
+  acceptGitHubReview(input: unknown, deliveryId: string): boolean {
+    const parsed = GitHubReviewSchema.safeParse(input);
+    if (!parsed.success || parsed.data.review.user.login !== "coderabbitai[bot]") return false;
+    const event = parsed.data;
+    return this.store.update(state => {
+      const key = `github:${deliveryId}`;
+      if (state.deliveries.includes(key)) return true;
+      // An unrelated repository webhook cannot create a Linear handoff.
+      if (!Object.values(state.sessions).some(session => session.branch === event.pull_request.head.ref && !session.supersededBy && session.status !== "closed")) return false;
+      state.deliveries.push(key);
+      (state.githubReviews ??= []).push(event);
+      return true;
+    });
+  }
   accept(input: unknown): void {
     if (typeof input === "object" && input !== null && "type" in input && input.type === "Issue") {
       const event = z.object({ action: z.string(), organizationId: z.string(), data: z.object({ id: z.string(), updatedAt: z.string() }), updatedFrom: z.record(z.unknown()).optional() }).parse(input);
@@ -227,6 +246,7 @@ export class Bridge {
     return this.ticking;
   }
   private async work() {
+    await this.processGitHubReviews();
     const failedSessions = new Set<string>();
     for (const outgoing of this.store.read().outbox) {
       if (failedSessions.has(outgoing.sessionId)) continue;
@@ -285,6 +305,61 @@ export class Bridge {
         });
       }
     }));
+  }
+  private async processGitHubReviews() {
+    if (!this.options.githubReviews) return;
+    for (const event of this.store.read().githubReviews ?? []) {
+      if ((this.reviewRetryAt.get(event.review.id) ?? 0) > Date.now()) continue;
+      try {
+        const candidates = Object.values(this.store.read().sessions).filter(s => s.branch === event.pull_request.head.ref && !s.supersededBy && s.status !== "closed" && s.route);
+        const matches: Session[] = [];
+        for (const candidate of candidates) {
+          const pr = await this.options.pullRequests.find(candidate.route!, candidate.branch);
+          if (pr?.url === event.pull_request.html_url && pr.number === event.pull_request.number) matches.push(candidate);
+        }
+        if (matches.length !== 1) throw new Error("CodeRabbit PR does not map to one current ticket session.");
+        const session = matches[0]!;
+        const pr = await this.options.githubReviews.verify(event);
+        if (!pr.open || pr.url !== event.pull_request.html_url || pr.branch !== session.branch || pr.head !== event.review.commit_id) {
+          this.dropGitHubReview(event);
+          continue;
+        }
+        const issue = await this.options.linear.issue(session.issueId);
+        if (!issue.delegated || issue.state.name !== "Ready for review" || !issue.project?.id) {
+          // The PR review may precede the final Linear status update.
+          const targetName = event.review.state === "approved" ? "Ready for UAT" : "Ready for implementation";
+          if (event.handoffIssued && issue.state.name === targetName || issue.state.name !== "Ready for implementation") this.dropGitHubReview(event);
+          else this.reviewRetryAt.set(event.review.id, Date.now() + this.options.prPollMs);
+          continue;
+        }
+        if (event.review.state === "approved" && !pr.checksPassing) {
+          this.reviewRetryAt.set(event.review.id, Date.now() + this.options.prPollMs);
+          continue;
+        }
+        const targetName = event.review.state === "approved" ? "Ready for UAT" : "Ready for implementation";
+        const stateId = await this.options.linear.statusId(issue.team.id, targetName);
+        if (!stateId) throw new Error(`Linear status ${targetName} is unavailable.`);
+        const identity = createHash("sha256").update(`${event.repository.full_name}:${event.pull_request.number}:${event.review.id}`).digest("hex");
+        const commentId = `${identity.slice(0, 8)}-${identity.slice(8, 12)}-4${identity.slice(13, 16)}-a${identity.slice(17, 20)}-${identity.slice(20, 32)}`;
+        const note = `CodeRabbit ${event.review.state === "approved" ? "approved" : "requested changes"} on [PR #${event.pull_request.number}](${pr.url}) at commit \`${pr.head}\`. [Review findings](${event.review.html_url}).${event.review.body ? `\n\n${event.review.body.slice(0, 4000)}` : ""}\n\nProposed handoff: ${targetName}.`;
+        await this.options.linear.comment(issue.id, note, commentId);
+        const fresh = await this.options.linear.issue(issue.id);
+        const latest = await this.options.githubReviews.verify(event);
+        if (fresh.state.id !== issue.state.id || !fresh.delegated || latest.head !== pr.head || !latest.open || (event.review.state === "approved" && !latest.checksPassing)) continue;
+        this.store.update(state => { const queued = state.githubReviews?.find(item => item.review.id === event.review.id); if (queued) queued.handoffIssued = true; });
+        await this.options.linear.updateReviewHandoff(issue.id, stateId, event.review.state === "approved");
+        const saved = await this.options.linear.issue(issue.id);
+        if (saved.state.id !== stateId || (event.review.state === "approved" && saved.delegate)) throw new Error("Linear review handoff could not be verified.");
+        this.dropGitHubReview(event);
+      } catch (error) {
+        this.reviewRetryAt.set(event.review.id, Date.now() + this.options.prPollMs);
+        console.error("GitHub review handoff retained for retry", { reviewId: event.review.id, message: redact(error instanceof Error ? error.message : String(error)) });
+      }
+    }
+  }
+  private dropGitHubReview(event: GitHubReview) {
+    this.reviewRetryAt.delete(event.review.id);
+    this.store.update(state => { state.githubReviews = (state.githubReviews ?? []).filter(item => item !== event && !(item.repository.full_name === event.repository.full_name && item.pull_request.number === event.pull_request.number && item.review.id === event.review.id)); });
   }
   private requestCancellation(session: Session) {
     if (session.publication) { (session.publicationHistory ??= []).push(session.publication); delete session.publication; }

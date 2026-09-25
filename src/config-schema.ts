@@ -6,6 +6,7 @@ const serviceUrl = z.string().url().refine(value => {
 }, "must be an HTTP(S) URL without credentials, query or fragment");
 export const ConfigSchema = z.object({
   LINEAR_CLIENT_ID: z.string().min(1), LINEAR_CLIENT_SECRET: z.string().min(1), LINEAR_WEBHOOK_SECRET: z.string().min(1),
+  GITHUB_WEBHOOK_SECRET: z.preprocess(emptyStringAsUndefined, z.string().min(16).optional()),
   INSTALL_SECRET: z.preprocess(emptyStringAsUndefined, z.string().min(16).optional()),
   LINEAR_REDIRECT_URI: z.string().url(), BASE_URL: serviceUrl,
   T3CODE_URL: serviceUrl, T3CODE_TOKEN: z.string().min(1),
