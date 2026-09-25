@@ -583,9 +583,10 @@ export class Bridge {
         if (session.route!.workspaceMode === "local") await prepareCheckout(session.route!, session.branch);
       } catch (error) { throw new IntegrationError(`${error instanceof Error ? error.message : "Workspace preparation failed."} Files preserved; correct Git state and send resume.`, false); }
       if (!stillCurrent()) return;
+      if (!session.command && (!gateIssue.project?.name || !gateIssue.state?.name)) throw new IntegrationError("Linear project or issue status name is unavailable; restore access and resume.", false);
       const command: RunnerCommand = session.command ?? {
         type: "thread.create", commandId: randomUUID(), threadId: session.threadId,
-        projectId: session.route!.t3ProjectId, title: gateIssue.title,
+        projectId: session.route!.t3ProjectId, title: `${gateIssue.project!.name}: ${gateIssue.title} - ${gateIssue.state.name}`,
         modelSelection: session.route!.modelSelection,
         runtimeMode: "full-access", interactionMode: "default", branch: session.branch,
         worktreePath: session.worktree, createdAt: session.createdAt,

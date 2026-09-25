@@ -114,7 +114,7 @@ async function fixture(t: TestContext) {
       } else if (query.includes("BridgeTeamStatuses")) {
         res.end(JSON.stringify({ data: { team: { states: { nodes: statusNodes, pageInfo: { hasNextPage: false } } } } }));      } else {
         reads.push(variables);
-        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: variables.id === "issue-1" ? "NOR-1" : `NOR-${variables.id}`, title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
+        res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { state: { id: "implement", name: "implement", description: "t3code: implement", team: { id: "team-1" }, type: "started" }, delegate: { id: "app" }, parent: null, id: variables.id, identifier: variables.id === "issue-1" ? "NOR-1" : `NOR-${variables.id}`, title: "Make a change", description: "Use https://example.org/design", url: "https://linear.app/test/issue/NOR-1", project: { id: "project-1", name: "Test project" }, team: { id: "team-1" }, children: { nodes: Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id, child]) => ({ id, ...child })), pageInfo: { hasNextPage: false } }, comments: { nodes: [], pageInfo: { hasNextPage: false } }, attachments: { nodes: [], pageInfo: { hasNextPage: false } }, relations: { nodes: [], pageInfo: { hasNextPage: false } }, inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } }, ...issueOverrides[variables.id], ...(variables.after ? issueOverrides[variables.id + ":" + variables.after] : {}) } } }));
       }
     } else {
       assert.equal(req.headers.authorization, "Bearer t3-secret");
@@ -241,17 +241,18 @@ const delegation = (session = "session-1") => ({ action: "created", organization
 
 test("signed delegation creates one isolated configured T3Code turn and reports intake", async t => {
   const f = await fixture(t);
+  f.issueOverrides["issue-1"] = { project: { id: "project-1", name: "ReportXL" }, title: "Organisation lifecycle and workspace settings", state: { id: "implement", name: "Ready for grilling", description: "t3code: implement", team: { id: "team-1" }, type: "started" } };
   assert.equal((await f.send(delegation(), false)).status, 401);
   assert.equal((await f.send({ ...delegation(), webhookTimestamp: 1 })).status, 401);
   assert.equal((await f.send(delegation())).status, 200);
   await f.tick();
   assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
-  assert.equal(f.commands.find(c => c.type === "thread.create").title, "Make a change");
+  assert.equal(f.commands.find(c => c.type === "thread.create").title, "ReportXL: Organisation lifecycle and workspace settings - Ready for grilling");
   const start = f.commands.find(c => c.type === "thread.turn.start");
   assert.ok(start);
   assert.deepEqual(start.modelSelection, { instanceId: "codex", model: "test-model" });
   assert.equal(start.runtimeMode, "full-access");
-  assert.match(start.message.text, /Make a change/);
+  assert.match(start.message.text, /Organisation lifecycle and workspace settings/);
   assert.match(start.message.text, /https:\/\/example.org\/design/);
   const thread = [...f.threads.values()][0];
   assert.notEqual(thread.worktreePath, f.repo);
@@ -907,7 +908,7 @@ test("unavailable worktree files do not block provider cancellation", async t =>
 
 test("unmarked delegated status does not start a workflow", async t => {
   const f = await fixture(t);
-  f.issueOverrides["issue-1"] = { state: { id: "review", description: "Human review", team: { id: "team-1" } }, delegate: { id: "app" } };
+  f.issueOverrides["issue-1"] = { state: { id: "review", name: "review", description: "Human review", team: { id: "team-1" } }, delegate: { id: "app" } };
   await f.send(delegation()); await f.tick();
   assert.equal(f.commands.length, 0);
 });
@@ -924,7 +925,7 @@ test("missing required skills fail before execution", async t => {
 test("grilling completes without validation or PR and follow-ups retain the selected prompt after YAML edits", async t => {
   const f = await fixture(t);
   f.options.pullRequests.find = async () => null;
-  f.issueOverrides["issue-1"] = { state: { id: "grill-me", description: "Unused description", team: { id: "team-1" } } };
+  f.issueOverrides["issue-1"] = { state: { id: "grill-me", name: "grill-me", description: "Unused description", team: { id: "team-1" } } };
   await f.send(delegation()); await f.tick();
   const thread = [...f.threads.values()][0];
   thread.latestTurn.state = "completed";
@@ -944,7 +945,7 @@ test("grilling completes without validation or PR and follow-ups retain the sele
 
 const statusEvent = (eventId: string) => ({ type: "Issue", action: "update", organizationId: "workspace-1", webhookId: eventId, data: { id: "issue-1", updatedAt: eventId }, updatedFrom: { stateId: "previous" } });
 function move(f: Awaited<ReturnType<typeof fixture>>, workflow: string, id = workflow) {
-  f.issueOverrides["issue-1"] = { ...f.issueOverrides["issue-1"], state: { id, description: workflow ? `t3code: ${workflow}` : "Review", team: { id: "team-1" }, type: "unstarted" } };
+  f.issueOverrides["issue-1"] = { ...f.issueOverrides["issue-1"], state: { id, name: id, description: workflow ? `t3code: ${workflow}` : "Review", team: { id: "team-1" }, type: "unstarted" } };
 }
 
 test("status transitions stop first, honor new-thread and preserve the workspace", async t => {
@@ -968,7 +969,7 @@ test("status transitions stop first, honor new-thread and preserve the workspace
   f.faults.deferStop = false;
   f.issueOverrides["issue-1"].title = "Test issue for T3code connectivity";
   move(f, "implement"); await f.send(statusEvent("transition-3")); await f.tick(14);
-  assert.equal(f.commands.filter(c => c.type === "thread.create").at(-1).title, "Test issue for T3code connectivity");
+  assert.equal(f.commands.filter(c => c.type === "thread.create").at(-1).title, "Test project: Test issue for T3code connectivity - implement");
   turns = f.commands.filter(c => c.type === "thread.turn.start");
   assert.equal(turns.length, 3);
   assert.notEqual(turns[2].threadId, first.id);

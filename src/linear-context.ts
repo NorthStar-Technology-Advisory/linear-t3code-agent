@@ -6,8 +6,8 @@ import path from "node:path";
 import { linearGraphql, createAgentActivity, getAccessToken, type AgentActivityContent } from "./linear.js";
 export type IssueContext = {
   id: string; identifier: string; title: string; description: string | null; url: string;
-  project: { id: string } | null; team: { id: string };
-  state: { id: string; description: string | null; team: { id: string }; type: string };
+  project: { id: string; name: string } | null; team: { id: string };
+  state: { id: string; name: string; description: string | null; team: { id: string }; type: string };
   delegate: { id: string } | null; parent: { id: string } | null; delegated: boolean;
 };
 type Comment = { id: string; body: string; createdAt: string; user: { name: string } | null; externalUser?: { name: string } | null; botActor?: { name: string } | null };
@@ -31,7 +31,7 @@ export class LinearClient {
     return linearGraphql<T>(query, variables, { endpoint: this.endpoint, tokenPath: this.tokenPath });
   }
   async issue(id: string): Promise<IssueContext> {
-    const data = await this.query<{ issue: IssueContext | null; viewer: { id: string } }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id } team { id } state { id description type team { id } } delegate { id } parent { id } } viewer { id } }`, { id });
+    const data = await this.query<{ issue: IssueContext | null; viewer: { id: string } }>(`query BridgeIssue($id: String!) { issue(id: $id) { id identifier title description url project { id name } team { id } state { id name description type team { id } } delegate { id } parent { id } } viewer { id } }`, { id });
     if (!data.issue) throw new Error("Linear issue is unavailable; restore access and resume.");
     return { ...data.issue, delegated: Boolean(data.issue.delegate && data.issue.delegate.id === data.viewer?.id) };
   }
