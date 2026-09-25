@@ -1529,6 +1529,35 @@ test("agent-managed workflow follows its status prompt without bridge publicatio
   assert.ok(!f.activities.some(a => a.content.type === "error" && /validation\/context report/.test(a.content.body)));
 });
 
+test("external review preserves the implementation thread without starting a review turn", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.review = { output: "external-review", "new-thread": true, prompt: "Wait for CodeRabbit." };
+  await f.send(delegation()); await f.tick();
+  const implementation = f.commands.find(c => c.type === "thread.create");
+  assert.ok(implementation);
+  finish(f); await f.tick();
+  move(f, "review"); await f.send(statusEvent("to-external-review")); await f.tick(14);
+  assert.equal(f.commands.filter(c => c.type === "thread.create").length, 1);
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  assert.equal(f.threads.size, 1);
+  await f.restart(); await f.send(followup("review-followup", "Any news?")); await f.tick();
+  assert.equal(f.commands.filter(c => c.type === "thread.turn.start").length, 1);
+  move(f, "implement"); await f.send(statusEvent("back-to-implementation")); await f.tick(14);
+  const turns = f.commands.filter(c => c.type === "thread.turn.start");
+  assert.equal(turns.length, 2);
+  assert.notEqual(turns[1].threadId, implementation.threadId);
+  assert.equal(f.threads.get(turns[1].threadId).branch, f.threads.get(implementation.threadId).branch);
+});
+
+test("external review without prior implementation pauses without creating a thread", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.review = { output: "external-review", prompt: "Wait for CodeRabbit." };
+  move(f, "review");
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.length, 0);
+  assert.ok(f.activities.some(a => /requires an existing implementation thread/.test(a.content.body)));
+});
+
 test("new-thread applies on re-entry but never on follow-ups or restart", async t => {
   const f = await fixture(t);
   f.projectConfig.t3code.workflows[0].statuses.implement = { output: "comment", "new-thread": true, prompt: "Review this issue." };

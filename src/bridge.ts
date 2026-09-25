@@ -644,6 +644,16 @@ export class Bridge {
     const gate = workflowGate(gateIssue);
     this.store.update(s => { s.sessions[id].gateDirty = false; });
     if ((session.gate !== undefined && session.gate !== gate) || (session.gate === undefined && session.created && !session.stage)) {
+      if (session.stage?.output === "external-review") {
+        this.store.update(s => {
+          const current = s.sessions[id];
+          current.gate = gate;
+          delete current.stage;
+          current.queue = gateIssue.delegated ? [{ id: randomUUID(), body: "Enter the stage selected by the current Linear status." }] : [];
+          current.status = gateIssue.delegated ? "queued" : "idle";
+        });
+        return;
+      }
       this.store.update(s => {
         const current = s.sessions[id];
         current.gate = gate;
@@ -660,6 +670,10 @@ export class Bridge {
     if (!stillCurrent()) return;
     const selectedStatus = projectConfig ? selectStatus(gateIssue, projectConfig) : undefined;
     if (!gateIssue.delegated || (!session.stage && !selectedStatus)) {
+      this.store.update(s => { s.sessions[id].status = "idle"; s.sessions[id].queue = []; });
+      return;
+    }
+    if (session.stage?.output === "external-review") {
       this.store.update(s => { s.sessions[id].status = "idle"; s.sessions[id].queue = []; });
       return;
     }
@@ -692,11 +706,14 @@ export class Bridge {
           route: structuredClone(predecessor.route), branch: predecessor.branch,
           worktree: predecessor.worktree, pr: predecessor.pr, teamId: gateIssue.team.id,
           bootstrapRecoveryPending: predecessor.bootstrapRecoveryPending,
+          ...(selectedStatus?.output === "external-review" ? { threadId: predecessor.threadId, created: predecessor.created,
+            sequence: predecessor.sequence, seenActivities: [...predecessor.seenActivities] } : {}),
         }));
         session = this.session(id);
       }
     }
     if (!session.route) {
+      if (selectedStatus?.output === "external-review") throw new IntegrationError("Ready for review requires an existing implementation thread and ticket branch; no coding session was started.", false);
       let route: Route;
       try {
         const title = projectConfig!.project;
@@ -713,6 +730,17 @@ export class Bridge {
         s.sessions[id].route = route; s.sessions[id].teamId = gateIssue.team.id;
       });
       session = this.session(id);
+    }
+    if (!session.stage && selectedStatus?.output === "external-review") {
+      if (!session.created) throw new IntegrationError("Ready for review requires an existing implementation thread; no coding session was started.", false);
+      this.store.update(s => {
+        const current = s.sessions[id];
+        current.stage = { id: randomUUID(), output: "external-review", statusId: gateIssue.state.id, teamId: gateIssue.team.id,
+          prompt: selectedStatus.prompt, instructions: projectConfig!.instructions, skills: [] };
+        current.queue = [];
+        current.status = "idle";
+      });
+      return;
     }
     if (!session.stage) {
       const settings = selectedStatus!;

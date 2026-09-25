@@ -48,6 +48,11 @@ test("explicit agent-managed output accepts direct Linear workflow prompts", () 
   assert.equal(parseProjectConfig(fence(input)).workflows[0]!.statuses.Todo.output, "agent-managed");
 });
 
+test("external-review output accepts a passive review stage", () => {
+  const content = '```yaml\nt3code:\n  version: 1\n  project: Zenith\n  workflows:\n    - team: NOR\n      statuses:\n        Ready for review:\n          output: external-review\n          prompt: Wait for CodeRabbit.\n```';
+  assert.equal(parseProjectConfig(content).workflows[0].statuses["Ready for review"].output, "external-review");
+});
+
 test("resolves exact team/status names to IDs across paginated collections", async () => {
   const query = async <T>(text: string, variables?: Record<string, unknown>): Promise<T> => {
     if (text.includes("BridgeProjectConfig")) return { project: { content: fence(config()) } } as T;
