@@ -64,7 +64,7 @@ async function fixture(t: TestContext) {
   const artifactWrites: any[] = [];
   const comments: any[] = [];
   const relations: any[] = [];
-  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false };
+  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false, emptySkillRefreshes: 0 };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -210,7 +210,9 @@ async function fixture(t: TestContext) {
         }).catch(() => socket.close()); return;
       }
       if (message.tag === "server.refreshProviders") {
-        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, workspaceSnapshots: [{ cwd: message.payload.cwd, skills }] })) } } })); return;
+        const discoveredSkills = faults.emptySkillRefreshes > 0 ? [] : skills;
+        if (faults.emptySkillRefreshes > 0) faults.emptySkillRefreshes--;
+        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, workspaceSnapshots: [{ cwd: message.payload.cwd, skills: discoveredSkills }] })) } } })); return;
       }
       if (message.tag === "server.getSettings" || message.tag === "server.getConfig") {
         socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: message.tag === "server.getSettings" ? settings : { providers } } })); return;
@@ -278,6 +280,25 @@ async function fixture(t: TestContext) {
   };
 }
 const delegation = (session = "session-1") => ({ action: "created", organizationId: "workspace-1", agentSession: { id: session, issue: { id: session === "session-1" ? "issue-1" : `issue-${session}` } } });
+
+test("a temporary empty skill refresh does not pause the next workflow stage", async t => {
+  const f = await fixture(t);
+  f.faults.emptySkillRefreshes = 1;
+  await f.send(delegation()); await f.tick();
+  assert.ok(f.commands.some(command => command.type === "thread.turn.start"));
+  assert.equal(f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)), false);
+});
+
+test("a paused stage resumes when its required T3Code skill becomes available", async t => {
+  const f = await fixture(t);
+  f.faults.emptySkillRefreshes = 3;
+  await f.send(delegation());
+  for (let i = 0; i < 8 && !f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)); i++) await f.tick(1);
+  assert.equal(f.commands.some(command => command.type === "thread.turn.start"), false);
+  assert.ok(f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)));
+  await f.tick();
+  assert.ok(f.commands.some(command => command.type === "thread.turn.start"));
+});
 
 test("an active turn reuses its verified Linear gate between webhook changes", async t => {
   const f = await fixture(t);

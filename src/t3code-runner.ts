@@ -48,11 +48,18 @@ export class T3CodeRunner implements Runner {
 
   async skill(name: string, repository: string, instanceId: string): Promise<string> {
     const skillSchema = z.object({ name: z.string(), path: z.string(), enabled: z.boolean(), userInvocable: z.boolean().optional() });
-    const result = z.object({ providers: z.array(z.object({ instanceId: z.string(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) }).safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
-    const skills = result.success ? result.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
-    const matches = skills?.filter(s => s.name === name && s.enabled && s.userInvocable !== false) ?? [];
-    if (matches.length !== 1) throw new IntegrationError(`Workflow skill ${name} is unavailable or ambiguous for ${instanceId} in ${repository}. Install/enable it in the T3Code execution environment, verify workspace skill discovery, then send resume. The bridge does not install skills.`, false);
-    return matches[0]!.path;
+    const responseSchema = z.object({ providers: z.array(z.object({ instanceId: z.string(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) });
+    // Provider refresh can briefly return an incomplete workspace inventory.
+    // Confirm an apparent miss before treating a required skill as unavailable.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = responseSchema.safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
+      const skills = result.success ? result.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
+      const matches = skills?.filter(s => s.name === name && s.enabled && s.userInvocable !== false) ?? [];
+      if (matches.length === 1) return matches[0]!.path;
+      if (matches.length > 1) break;
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1_000));
+    }
+    throw new IntegrationError(`Workflow skill ${name} is unavailable or ambiguous for ${instanceId} in ${repository}. Install/enable it in the T3Code execution environment, verify workspace skill discovery, then send resume. The bridge does not install skills.`, false);
   }
 
   async projects() {

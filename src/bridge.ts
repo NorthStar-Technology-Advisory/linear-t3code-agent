@@ -260,6 +260,27 @@ export class Bridge {
     this.ticking = this.work().finally(() => { this.ticking = undefined; });
     return this.ticking;
   }
+  private async recoverAvailableSkills() {
+    for (const session of Object.values(this.store.read().sessions)) {
+      const skill = /^Workflow skill (\S+) is unavailable or ambiguous\b/.exec(session.lastError ?? "")?.[1];
+      if (session.status !== "paused" || !skill || !session.route || !session.queue.length || (session.nextStepAt ?? 0) > Date.now()) continue;
+      try {
+        await this.options.runner.skill(skill, session.worktree ?? session.route.repository, session.route.modelSelection.instanceId);
+        this.store.update(state => {
+          const current = state.sessions[session.id];
+          if (current.status !== "paused" || current.lastError !== session.lastError) return;
+          current.status = "queued";
+          delete current.lastError; delete current.nextStepAt;
+          this.report(state, current, "thought", `Required T3Code skill ${skill} is available; resuming queued work.`);
+        });
+      } catch {
+        this.store.update(state => {
+          const current = state.sessions[session.id];
+          if (current.status === "paused" && current.lastError === session.lastError) current.nextStepAt = Date.now() + 60_000;
+        });
+      }
+    }
+  }
   private async work() {
     await this.processGitHubMerges();
     await this.processGitHubReviews();
@@ -295,6 +316,7 @@ export class Bridge {
         }
       }
     }
+    await this.recoverAvailableSkills();
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];
     for (const session of Object.values(this.store.read().sessions)) {
