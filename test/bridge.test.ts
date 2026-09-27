@@ -53,6 +53,7 @@ async function fixture(t: TestContext) {
     }])) }] } };
   const projectDocument = { content: undefined as string | undefined };
   const statusNodes = ["grill-me", "to-spec", "to-tickets", "implement", "review"].map(name => ({ id: name, name }));
+  statusNodes.push({ id: "retro", name: "Retro" });
   let sequence = 0;
   const issueOverrides: Record<string, any> = {};
   let heldIssueRead: { remaining: number; entered: () => void; wait: Promise<void> } | undefined;
@@ -89,6 +90,7 @@ async function fixture(t: TestContext) {
       if (query.includes("BridgeCurrentSession")) {
         res.end(JSON.stringify({ data: { viewer: { id: "app" }, issue: { agentSessions: { nodes: [...linearSessions.values()].filter(s => s.issueId === variables.id), pageInfo: { hasNextPage: false } } } } })); return;
       }
+      if (query.includes("BridgeAppUser")) { res.end(JSON.stringify({ data: { viewer: { id: "app" } } })); return; }
       if (query.includes("BridgeDeliverySessions")) {
         res.end(JSON.stringify({ data: { issue: { agentSessions: { nodes: [...linearSessions.values()].filter(s => s.issueId === variables.id).map(s => ({ id: s.id, archivedAt: archivedSessions.has(s.id) ? "2026-09-16T16:42:05Z" : null })), pageInfo: { hasNextPage: false } } } } })); return;
       }
@@ -113,7 +115,7 @@ async function fixture(t: TestContext) {
         res.end(JSON.stringify({ data: { issue: { comments: { nodes: comments.filter(c => c.id === variables.commentId) } } } })); return;
       }
       if (query.includes("BridgeReviewStatus")) {
-        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }, { id: "done", name: "Done" }, { id: "retro", name: "Retro" }] } } } })); return;
+        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }, { id: "done", name: "Done" }] } } } })); return;
       }
       if (query.includes("BridgeMergeChildren")) {
         const children = Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id]) => ({ id }));
@@ -129,7 +131,7 @@ async function fixture(t: TestContext) {
       if (query.includes("BridgeMergedIssueUpdate")) {
         if (faults.failMergedIssueId === variables.id) { faults.failMergedIssueId = ""; res.end(JSON.stringify({ data: { issueUpdate: { success: false } } })); return; }
         assert.equal(variables.input.stateId, "retro");
-        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: "retro", name: "Retro", team: { id: "team-1" }, type: "completed" }, delegate: null };
+        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: "retro", name: "Retro", team: { id: "team-1" }, type: "completed" }, delegate: variables.input.delegateId ? { id: variables.input.delegateId } : null };
         res.end(JSON.stringify({ data: { issueUpdate: { success: true } } })); return;
       }
       if (query.includes("AgentActivityCreate")) {
@@ -400,9 +402,39 @@ test("merged PR marks its saved Linear issue Retro after the agent session close
   assert.deepEqual(await response.json(), { ok: true, accepted: true });
   await f.tick();
   assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
-  assert.equal(f.issueOverrides["issue-1"].delegate, null);
+  assert.equal(f.issueOverrides["issue-1"].delegate?.id, "app");
   await f.sendGithub(event, true, "44444444-4444-4444-8444-444444444444", "pull_request"); await f.tick();
   assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
+});
+
+test("merged PR starts a fresh Retro session for the parent with prior thread context", async t => {
+  const f = await fixture(t);
+  f.skills.push({ name: "retro", path: "/skills/retro/SKILL.md", enabled: true });
+  f.projectConfig.t3code.workflows[0].statuses.Retro = {
+    output: "comment", "new-thread": true, "required-skills": ["retro"],
+    prompt: "Please use the $retro skill to review all threads associated with this issue",
+  };
+  await f.send(delegation()); await f.tick();
+  const first = f.commands.find(c => c.type === "thread.create");
+  assert.ok(first);
+  f.issueOverrides["issue-1"] = { state: { id: "uat", name: "Ready for UAT", team: { id: "team-1" }, type: "started" }, delegate: null };
+  f.pr.headRefName = first.branch;
+  f.pr.state = "MERGED";
+  f.options.pullRequests.find = async (_route: unknown, branch: string) => branch === first.branch ? f.pr : null;
+  const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: first.branch } } };
+  await f.sendGithub(event, true, "99999999-9999-4999-8999-999999999999", "pull_request"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
+  assert.equal(f.issueOverrides["issue-1"].delegate?.id, "app");
+
+  await f.send({ action: "created", organizationId: "workspace-1", agentSession: { id: "session-retro", issue: { id: "issue-1" } } });
+  await f.tick();
+  const second = f.commands.filter(c => c.type === "thread.create").at(-1);
+  assert.ok(second);
+  assert.notEqual(second.threadId, first.threadId);
+  assert.notEqual(second.branch, first.branch);
+  const retroTurn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  assert.match(JSON.stringify(retroTurn), /Please use the \$retro skill to review all threads associated with this issue/);
+  assert.match(JSON.stringify(retroTurn), new RegExp(first.threadId));
 });
 
 test("merged PR completes paginated child issues before the parent and retries a partial failure", async t => {

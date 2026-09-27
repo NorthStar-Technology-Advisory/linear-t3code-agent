@@ -357,31 +357,37 @@ export class Bridge {
       try {
         const candidates = Object.values(this.store.read().sessions).filter(s => s.branch === event.pull_request.head.ref && s.route);
         const matches: Session[] = [];
+        const matchedPrs = new Map<string, PullRequest>();
         for (const candidate of candidates) {
           const pr = await this.options.pullRequests.find(candidate.route!, candidate.branch);
-          if (pr?.url === event.pull_request.html_url && pr.number === event.pull_request.number && pr.state === "MERGED") matches.push(candidate);
+          if (pr?.url === event.pull_request.html_url && pr.number === event.pull_request.number && pr.state === "MERGED") {
+            matches.push(candidate);
+            matchedPrs.set(candidate.id, pr);
+          }
         }
         if (new Set(matches.map(s => s.issueId)).size !== 1 || !matches.length) throw new Error("Merged PR does not map to one saved Linear issue.");
         const verified = await this.options.githubReviews.verifyMerge(event);
         if (!verified.merged || verified.url !== event.pull_request.html_url || verified.branch !== event.pull_request.head.ref) throw new Error("GitHub has not verified this PR as merged.");
         const session = matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]!;
+        this.store.update(state => { state.sessions[session.id]!.pr = matchedPrs.get(session.id)!; });
         const issue = await this.options.linear.issue(session.issueId);
+        const appUserId = await this.options.linear.appUserId();
         const retroIds = new Map<string, string>();
-        const markRetro = async (target: typeof issue) => {
+        const markRetro = async (target: typeof issue, delegateId: string | null) => {
           let retroId = retroIds.get(target.team.id);
           if (!retroId) {
             retroId = await this.options.linear.statusId(target.team.id, "Retro");
             retroIds.set(target.team.id, retroId);
           }
-          if (target.state.id !== retroId || target.delegate) await this.options.linear.updateMergedIssue(target.id, retroId);
+          if (target.state.id !== retroId || target.delegate?.id !== (delegateId ?? undefined)) await this.options.linear.updateMergedIssue(target.id, retroId, delegateId);
           const saved = await this.options.linear.issue(target.id);
-          if (saved.state.id !== retroId || saved.delegate) throw new Error(`Merged PR issue ${target.identifier} could not be verified as Retro in Linear.`);
+          if (saved.state.id !== retroId || saved.delegate?.id !== (delegateId ?? undefined)) throw new Error(`Merged PR issue ${target.identifier} could not be verified as Retro with its expected delegation in Linear.`);
         };
         for (const childId of await this.options.linear.childIssueIds(issue.id)) {
           const child = await this.options.linear.issue(childId);
-          if (child.parent?.id === issue.id) await markRetro(child);
+          if (child.parent?.id === issue.id) await markRetro(child, null);
         }
-        await markRetro(issue);
+        await markRetro(issue, appUserId);
         this.dropGitHubMerge(event);
       } catch (error) {
         this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
@@ -727,6 +733,7 @@ export class Bridge {
     if (session.status !== "running" && !(session.status === "paused" && session.active)) return;
     if (session.stage && !session.stage.output) throw new IntegrationError("This session uses the previous workflow configuration. Cancel it and start a new delegation after adding project YAML.", false);
 
+    let postMergeRetro = false;
     if (!session.route) {
       // Session history is the durable ticket-workspace ledger. Only transfer it
       // after every previous provider has stopped (the ownership gate above).
@@ -734,29 +741,32 @@ export class Bridge {
         .filter(other => other.id !== id && other.workspaceId === session.workspaceId && other.issueId === session.issueId && other.route)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (predecessor) {
-        if (predecessor.cleanup || (predecessor.pr && predecessor.pr.state !== "OPEN")) throw new IntegrationError("This ticket's PR has closed or merged. Its workspace is retired; create a new Linear ticket for further work.", false);
-        if (predecessor.route!.workspaceMode !== "worktree") throw new IntegrationError("This ticket uses a legacy current checkout. Preserve its changes and finish it before starting a new ticket with an isolated worktree.", false);
-        if (predecessor.workspaceRequested && !predecessor.worktree) {
-          const snapshot = await this.options.runner.snapshot(predecessor.threadId);
-          if (snapshot) predecessor = await this.reconcileWorkspace(predecessor, snapshot.thread);
+        postMergeRetro = gateIssue.state.name === "Retro" && selectedStatus?.output === "comment" && predecessor.pr?.state === "MERGED";
+        if ((predecessor.cleanup || (predecessor.pr && predecessor.pr.state !== "OPEN")) && !postMergeRetro) throw new IntegrationError("This ticket's PR has closed or merged. Its workspace is retired; create a new Linear ticket for further work.", false);
+        if (!postMergeRetro) {
+          if (predecessor.route!.workspaceMode !== "worktree") throw new IntegrationError("This ticket uses a legacy current checkout. Preserve its changes and finish it before starting a new ticket with an isolated worktree.", false);
+          if (predecessor.workspaceRequested && !predecessor.worktree) {
+            const snapshot = await this.options.runner.snapshot(predecessor.threadId);
+            if (snapshot) predecessor = await this.reconcileWorkspace(predecessor, snapshot.thread);
+          }
+          if (predecessor.workspaceRequested && !predecessor.worktree) throw new IntegrationError("The previous session requested a worktree but its path is unverified. Reconcile its T3Code workspace before retrying; no replacement workspace was created.", false);
+          if (predecessor.worktree) {
+            let root: string;
+            try { root = await realpath(predecessor.worktree); }
+            catch { throw new IntegrationError("The ticket worktree is missing. Restore it before resuming; no replacement workspace was created.", false); }
+            const entries = (await git(predecessor.route!.repository, "worktree", "list", "--porcelain")).split("\n\n");
+            if (!entries.some(entry => entry.split("\n").includes(`worktree ${root}`) && entry.split("\n").includes(`branch refs/heads/${predecessor.branch}`))) throw new IntegrationError("The ticket worktree is missing or its branch changed. Restore it before resuming.", false);
+          }
+          if (!stillCurrent()) return;
+          this.store.update(s => Object.assign(s.sessions[id], {
+            route: structuredClone(predecessor.route), branch: predecessor.branch,
+            worktree: predecessor.worktree, pr: predecessor.pr, teamId: gateIssue.team.id,
+            bootstrapRecoveryPending: predecessor.bootstrapRecoveryPending,
+            ...(selectedStatus?.output === "external-review" ? { threadId: predecessor.threadId, created: predecessor.created,
+              sequence: predecessor.sequence, seenActivities: [...predecessor.seenActivities] } : {}),
+          }));
+          session = this.session(id);
         }
-        if (predecessor.workspaceRequested && !predecessor.worktree) throw new IntegrationError("The previous session requested a worktree but its path is unverified. Reconcile its T3Code workspace before retrying; no replacement workspace was created.", false);
-        if (predecessor.worktree) {
-          let root: string;
-          try { root = await realpath(predecessor.worktree); }
-          catch { throw new IntegrationError("The ticket worktree is missing. Restore it before resuming; no replacement workspace was created.", false); }
-          const entries = (await git(predecessor.route!.repository, "worktree", "list", "--porcelain")).split("\n\n");
-          if (!entries.some(entry => entry.split("\n").includes(`worktree ${root}`) && entry.split("\n").includes(`branch refs/heads/${predecessor.branch}`))) throw new IntegrationError("The ticket worktree is missing or its branch changed. Restore it before resuming.", false);
-        }
-        if (!stillCurrent()) return;
-        this.store.update(s => Object.assign(s.sessions[id], {
-          route: structuredClone(predecessor.route), branch: predecessor.branch,
-          worktree: predecessor.worktree, pr: predecessor.pr, teamId: gateIssue.team.id,
-          bootstrapRecoveryPending: predecessor.bootstrapRecoveryPending,
-          ...(selectedStatus?.output === "external-review" ? { threadId: predecessor.threadId, created: predecessor.created,
-            sequence: predecessor.sequence, seenActivities: [...predecessor.seenActivities] } : {}),
-        }));
-        session = this.session(id);
       }
     }
     if (!session.route) {
@@ -769,7 +779,7 @@ export class Bridge {
         route = { repository: await realpath(project.workspaceRoot), t3ProjectId: project.id, ...execution, workspaceMode: "worktree", baseBranch: "" };
         if (route.workspaceMode === "worktree") route.baseBranch = await this.options.runner.baseBranch(route.repository);
       } catch (error) { throw new IntegrationError(error instanceof Error ? error.message : "Project resolution failed; correct T3Code settings and send resume.", false); }
-      const branch = ticketBranch(gateIssue.identifier, gateIssue.title);
+      const branch = `${ticketBranch(gateIssue.identifier, gateIssue.title)}${postMergeRetro ? `-retro-${session.threadId.slice(0, 8)}` : ""}`;
       if (await git(route.repository, "for-each-ref", "--format=%(refname)", `refs/heads/${branch}`)) throw new IntegrationError(`Branch ${branch} already exists without a saved ticket workspace. Reconcile the existing branch before resuming; files were preserved.`, false);
       if (!stillCurrent()) return;
       this.store.update(s => {
@@ -993,7 +1003,10 @@ export class Bridge {
       const contextText = context.text.length < 80_000 ? context.text : `Complete context (${context.text.length} characters) is supplied in ${contextFile}. Read this file in full before acting; no content was truncated.`;
       if (!stillCurrent()) return;
       const turn = session.queue[0];
-      const instructions = `${workflowInstructions(session.stage!)}\nRetained artifact identities: ${JSON.stringify(session.artifacts ?? { children: {}, relations: {} })}`;
+      const priorThreads = issue.state.name === "Retro" ? [...new Set(Object.values(this.store.read().sessions)
+        .filter(other => other.issueId === issue.id)
+        .flatMap(other => [...(other.previousThreads ?? []).map(thread => thread.threadId), ...(other.id === id ? [] : [other.threadId])]))] : [];
+      const instructions = `${workflowInstructions(session.stage!)}\nRetained artifact identities: ${JSON.stringify(session.artifacts ?? { children: {}, relations: {} })}${priorThreads.length ? `\nPrevious T3Code threads associated with this issue: ${priorThreads.join(", ")}` : ""}`;
       let text = `${instructions}\n\n${contextChange}\n${contextText}\n\n${turn.body}`;
       if (text.length > 100_000) {
         const turnFile = path.join(directory, `${turn.id}.txt`);

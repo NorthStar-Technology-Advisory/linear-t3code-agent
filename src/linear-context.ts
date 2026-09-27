@@ -61,6 +61,11 @@ export class LinearClient {
   projectTitle(projectId: string | undefined): Promise<string> {
     return projectTitle((query, variables) => this.query(query, variables), projectId);
   }
+  async appUserId(): Promise<string> {
+    const data = await this.query<{ viewer: { id: string } | null }>(`query BridgeAppUser { viewer { id } }`);
+    if (!data.viewer?.id) throw new Error("Linear app identity is unavailable.");
+    return data.viewer.id;
+  }
   async statusId(teamId: string, name: string): Promise<string> {
     const data = await this.query<{ team: { states: { nodes: Array<{ id: string; name: string }> } } | null }>(
       `query BridgeReviewStatus($id: String!) { team(id: $id) { states(first: 100) { nodes { id name } } } }`, { id: teamId });
@@ -91,10 +96,10 @@ export class LinearClient {
       `mutation BridgeReviewHandoff($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`, { id: issueId, input });
     if (!data.issueUpdate.success) throw new Error("Linear review handoff was not saved.");
   }
-  async updateMergedIssue(issueId: string, retroStateId: string): Promise<void> {
+  async updateMergedIssue(issueId: string, retroStateId: string, delegateId: string | null): Promise<void> {
     const data = await this.query<{ issueUpdate: { success: boolean } }>(
       `mutation BridgeMergedIssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
-      { id: issueId, input: { stateId: retroStateId, delegateId: null } });
+      { id: issueId, input: { stateId: retroStateId, delegateId } });
     if (!data.issueUpdate.success) throw new Error("Linear issue was not marked Retro after PR merge.");
   }
   private async connection<T>(id: string, field: keyof typeof fields): Promise<T[]> {
