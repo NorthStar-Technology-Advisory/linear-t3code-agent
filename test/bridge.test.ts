@@ -337,6 +337,24 @@ test("signed CodeRabbit review moves a current PR back to implementation once", 
   assert.equal(f.comments.length, 1);
 });
 
+test("an actionable CodeRabbit COMMENTED review returns to implementation", async t => {
+  const f = await fixture(t);
+  await f.send(delegation()); await f.tick();
+  const branch = f.commands.find(command => command.type === "thread.create")?.branch;
+  assert.ok(branch);
+  f.issueOverrides["issue-1"] = { state: { id: "review", name: "Ready for review", team: { id: "team-1" }, type: "started" } };
+  const review = { action: "submitted", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, head: { ref: branch } },
+    review: { id: 104, state: "commented", commit_id: "a".repeat(40), html_url: f.pr.url + "#pullrequestreview-104", body: "Review complete.", user: { login: "coderabbitai[bot]" } } };
+  await f.sendGithub(review, true, "44444444-4444-4444-8444-444444444444"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for review");
+  review.review.id = 105;
+  review.review.html_url = f.pr.url + "#pullrequestreview-105";
+  review.review.body = "**⚠️ Outside diff range comments (1)**\n<!-- cr-comment:v1:123abc -->";
+  await f.sendGithub(review, true, "55555555-5555-4555-8555-555555555555"); await f.tick();
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for implementation");
+  assert.equal(f.comments.length, 1);
+});
+
 test("CodeRabbit approval advances to UAT only for passing checks and clears delegation", async t => {
   const f = await fixture(t);
   await f.send(delegation()); await f.tick();

@@ -15,7 +15,7 @@ import { workflowInstructions, deliveryResult } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
-import { GitHubReviewSchema, GitHubMergeSchema, type GitHubReview, type GitHubMerge, type GitHubReviews } from "./github-review.js";
+import { GitHubReviewSchema, GitHubMergeSchema, isActionableCodeRabbitReview, type GitHubReview, type GitHubMerge, type GitHubReviews } from "./github-review.js";
 import { createHash } from "node:crypto";
 
 const WebhookSchema = z.object({
@@ -72,7 +72,7 @@ export class Bridge {
   async close() { clearInterval(this.timer); await this.ticking; this.store.close(); }
   acceptGitHubReview(input: unknown, deliveryId: string): boolean {
     const parsed = GitHubReviewSchema.safeParse(input);
-    if (!parsed.success || parsed.data.review.user.login !== "coderabbitai[bot]") return false;
+    if (!parsed.success || parsed.data.review.user.login !== "coderabbitai[bot]" || !isActionableCodeRabbitReview(parsed.data.review)) return false;
     const event = parsed.data;
     return this.store.update(state => {
       const key = `github:${deliveryId}`;

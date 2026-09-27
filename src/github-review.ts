@@ -10,10 +10,17 @@ export const GitHubReviewSchema = z.object({
   action: z.literal("submitted"),
   repository: z.object({ full_name: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }),
   pull_request: z.object({ number: z.number().int().positive(), html_url: z.string().url(), head: z.object({ ref: z.string().min(1) }) }),
-  review: z.object({ id: z.number().int().positive(), state: z.enum(["approved", "changes_requested"]), commit_id: sha,
+  review: z.object({ id: z.number().int().positive(), state: z.enum(["approved", "changes_requested", "commented"]), commit_id: sha,
     html_url: z.string().url(), body: z.string().nullable().optional(), user: z.object({ login: z.string() }) }),
 });
 export type GitHubReview = z.infer<typeof GitHubReviewSchema>;
+export function isActionableCodeRabbitReview(review: GitHubReview["review"]): boolean {
+  if (review.state !== "commented") return true;
+  const body = review.body ?? "";
+  return /<!--\s*cr-comment:v1:[^>]+-->/.test(body) ||
+    /Actionable comments posted:\s*[1-9]\d*/i.test(body) ||
+    /Outside diff range comments\s*\([1-9]\d*\)/i.test(body);
+}
 export const GitHubMergeSchema = z.object({
   action: z.literal("closed"),
   repository: z.object({ full_name: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }),
