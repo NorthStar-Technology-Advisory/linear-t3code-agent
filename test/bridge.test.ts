@@ -113,7 +113,7 @@ async function fixture(t: TestContext) {
         res.end(JSON.stringify({ data: { issue: { comments: { nodes: comments.filter(c => c.id === variables.commentId) } } } })); return;
       }
       if (query.includes("BridgeReviewStatus")) {
-        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }, { id: "done", name: "Done" }] } } } })); return;
+        res.end(JSON.stringify({ data: { team: { states: { nodes: [...statusNodes, { id: "uat", name: "Ready for UAT" }, { id: "implementation", name: "Ready for implementation" }, { id: "done", name: "Done" }, { id: "retro", name: "Retro" }] } } } })); return;
       }
       if (query.includes("BridgeMergeChildren")) {
         const children = Object.entries(issueOverrides).filter(([, child]) => child?.parent?.id === variables.id).map(([id]) => ({ id }));
@@ -128,7 +128,8 @@ async function fixture(t: TestContext) {
       }
       if (query.includes("BridgeMergedIssueUpdate")) {
         if (faults.failMergedIssueId === variables.id) { faults.failMergedIssueId = ""; res.end(JSON.stringify({ data: { issueUpdate: { success: false } } })); return; }
-        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: "done", name: "Done", team: { id: "team-1" }, type: "completed" }, delegate: null };
+        assert.equal(variables.input.stateId, "retro");
+        issueOverrides[variables.id] = { ...issueOverrides[variables.id], state: { id: "retro", name: "Retro", team: { id: "team-1" }, type: "completed" }, delegate: null };
         res.end(JSON.stringify({ data: { issueUpdate: { success: true } } })); return;
       }
       if (query.includes("AgentActivityCreate")) {
@@ -384,7 +385,7 @@ test("CodeRabbit review for an older PR head cannot change the Linear issue", as
   assert.equal(f.comments.length, 0);
 });
 
-test("merged PR marks its saved Linear issue Done after the agent session closes", async t => {
+test("merged PR marks its saved Linear issue Retro after the agent session closes", async t => {
   const f = await fixture(t);
   await f.send(delegation()); await f.tick();
   const branch = f.commands.find(c => c.type === "thread.create")?.branch;
@@ -398,10 +399,10 @@ test("merged PR marks its saved Linear issue Done after the agent session closes
   const response = await f.sendGithub(event, true, "44444444-4444-4444-8444-444444444444", "pull_request");
   assert.deepEqual(await response.json(), { ok: true, accepted: true });
   await f.tick();
-  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
   assert.equal(f.issueOverrides["issue-1"].delegate, null);
   await f.sendGithub(event, true, "44444444-4444-4444-8444-444444444444", "pull_request"); await f.tick();
-  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
 });
 
 test("merged PR completes paginated child issues before the parent and retries a partial failure", async t => {
@@ -418,16 +419,16 @@ test("merged PR completes paginated child issues before the parent and retries a
   const response = await f.sendGithub(event, true, "77777777-7777-4777-8777-777777777777", "pull_request");
   assert.deepEqual(await response.json(), { ok: true, accepted: true });
   await f.tick(1);
-  assert.equal(f.issueOverrides["child-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["child-1"].state.name, "Retro");
   assert.equal(f.issueOverrides["child-2"].state.name, "Ready for UAT");
   assert.equal(f.issueOverrides["issue-1"].state.name, "Ready for UAT");
   await f.tick();
-  assert.equal(f.issueOverrides["child-2"].state.name, "Done");
+  assert.equal(f.issueOverrides["child-2"].state.name, "Retro");
   assert.equal(f.issueOverrides["child-2"].delegate, null);
-  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
 });
 
-test("merged PR still completes children when the parent is already Done", async t => {
+test("merged PR moves children and parent to Retro when the parent is already Done", async t => {
   const f = await fixture(t);
   await f.send(delegation()); await f.tick();
   const branch = f.commands.find(c => c.type === "thread.create")?.branch;
@@ -437,11 +438,11 @@ test("merged PR still completes children when the parent is already Done", async
   f.pr.state = "MERGED";
   const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: branch } } };
   await f.sendGithub(event, true, "88888888-8888-4888-8888-888888888888", "pull_request"); await f.tick();
-  assert.equal(f.issueOverrides["child-1"].state.name, "Done");
-  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["child-1"].state.name, "Retro");
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
 });
 
-test("closed but unmerged PR does not mark its Linear issue Done", async t => {
+test("closed but unmerged PR does not mark its Linear issue Retro", async t => {
   const f = await fixture(t);
   await f.send(delegation()); await f.tick();
   const branch = f.commands.find(c => c.type === "thread.create")?.branch;
@@ -466,7 +467,7 @@ test("merged PR handoff waits for GitHub verification and survives a bridge rest
   await f.restart();
   f.options.githubReviews.verifyMerge = async () => ({ url: f.pr.url, branch, merged: true });
   await f.tick();
-  assert.equal(f.issueOverrides["issue-1"].state.name, "Done");
+  assert.equal(f.issueOverrides["issue-1"].state.name, "Retro");
 });
 
 test("archived Linear sessions retain undelivered updates without blocking live sessions", async t => {

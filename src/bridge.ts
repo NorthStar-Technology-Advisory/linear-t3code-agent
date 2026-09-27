@@ -366,22 +366,22 @@ export class Bridge {
         if (!verified.merged || verified.url !== event.pull_request.html_url || verified.branch !== event.pull_request.head.ref) throw new Error("GitHub has not verified this PR as merged.");
         const session = matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]!;
         const issue = await this.options.linear.issue(session.issueId);
-        const doneIds = new Map<string, string>();
-        const markDone = async (target: typeof issue) => {
-          let doneId = doneIds.get(target.team.id);
-          if (!doneId) {
-            doneId = await this.options.linear.statusId(target.team.id, "Done");
-            doneIds.set(target.team.id, doneId);
+        const retroIds = new Map<string, string>();
+        const markRetro = async (target: typeof issue) => {
+          let retroId = retroIds.get(target.team.id);
+          if (!retroId) {
+            retroId = await this.options.linear.statusId(target.team.id, "Retro");
+            retroIds.set(target.team.id, retroId);
           }
-          if (target.state.id !== doneId || target.delegate) await this.options.linear.updateMergedIssue(target.id, doneId);
+          if (target.state.id !== retroId || target.delegate) await this.options.linear.updateMergedIssue(target.id, retroId);
           const saved = await this.options.linear.issue(target.id);
-          if (saved.state.id !== doneId || saved.delegate) throw new Error(`Merged PR issue ${target.identifier} could not be verified as Done in Linear.`);
+          if (saved.state.id !== retroId || saved.delegate) throw new Error(`Merged PR issue ${target.identifier} could not be verified as Retro in Linear.`);
         };
         for (const childId of await this.options.linear.childIssueIds(issue.id)) {
           const child = await this.options.linear.issue(childId);
-          if (child.parent?.id === issue.id) await markDone(child);
+          if (child.parent?.id === issue.id) await markRetro(child);
         }
-        await markDone(issue);
+        await markRetro(issue);
         this.dropGitHubMerge(event);
       } catch (error) {
         this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
