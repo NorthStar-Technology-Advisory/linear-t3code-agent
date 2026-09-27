@@ -48,12 +48,17 @@ export class T3CodeRunner implements Runner {
 
   async skill(name: string, repository: string, instanceId: string): Promise<string> {
     const skillSchema = z.object({ name: z.string(), path: z.string(), enabled: z.boolean(), userInvocable: z.boolean().optional() });
-    const responseSchema = z.object({ providers: z.array(z.object({ instanceId: z.string(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) });
+    const responseSchema = z.object({ providers: z.array(z.object({ instanceId: z.string(), skills: z.array(skillSchema).optional(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) });
     // Provider refresh can briefly return an incomplete workspace inventory.
     // Confirm an apparent miss before treating a required skill as unavailable.
     for (let attempt = 0; attempt < 3; attempt++) {
-      const result = responseSchema.safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
-      const skills = result.success ? result.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
+      const result = responseSchema.safeParse(await this.rpc("server.refreshProviders"));
+      const provider = result.success ? result.data.providers.find(p => p.instanceId === instanceId) : undefined;
+      let skills = provider?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills ?? provider?.skills;
+      if (!skills) {
+        const scoped = responseSchema.safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
+        skills = scoped.success ? scoped.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
+      }
       const matches = skills?.filter(s => s.name === name && s.enabled && s.userInvocable !== false) ?? [];
       if (matches.length === 1) return matches[0]!.path;
       if (matches.length > 1) break;

@@ -369,7 +369,6 @@ export class Bridge {
         const verified = await this.options.githubReviews.verifyMerge(event);
         if (!verified.merged || verified.url !== event.pull_request.html_url || verified.branch !== event.pull_request.head.ref) throw new Error("GitHub has not verified this PR as merged.");
         const session = matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]!;
-        this.store.update(state => { state.sessions[session.id]!.pr = matchedPrs.get(session.id)!; });
         const issue = await this.options.linear.issue(session.issueId);
         const appUserId = await this.options.linear.appUserId();
         const retroIds = new Map<string, string>();
@@ -388,6 +387,7 @@ export class Bridge {
           if (child.parent?.id === issue.id) await markRetro(child, null);
         }
         await markRetro(issue, appUserId);
+        this.store.update(state => { state.sessions[session.id]!.pr = matchedPrs.get(session.id)!; });
         this.dropGitHubMerge(event);
       } catch (error) {
         this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
@@ -655,7 +655,12 @@ export class Bridge {
     if (session.status === "cancelling") { await this.cancel(session); return; }
     if (session.supersededBy || session.status === "closed") return;
     if (session.pr && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) {
-      if (await this.checkPr(session)) return;
+      let retro = false;
+      if (session.pr.state !== "OPEN") {
+        const issue = await this.options.linear.issue(session.issueId);
+        retro = issue.delegated && issue.state.name === "Retro";
+      }
+      if (!retro && await this.checkPr(session)) return;
     }
     const generation = session.generation;
     const gateRevision = session.gateRevision ?? 0;

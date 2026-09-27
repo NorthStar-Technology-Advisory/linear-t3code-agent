@@ -65,7 +65,7 @@ async function fixture(t: TestContext) {
   const artifactWrites: any[] = [];
   const comments: any[] = [];
   const relations: any[] = [];
-  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false, emptySkillRefreshes: 0 };
+  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false, emptySkillRefreshes: 0, providerLevelSkills: false };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -215,7 +215,7 @@ async function fixture(t: TestContext) {
       if (message.tag === "server.refreshProviders") {
         const discoveredSkills = faults.emptySkillRefreshes > 0 ? [] : skills;
         if (faults.emptySkillRefreshes > 0) faults.emptySkillRefreshes--;
-        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, workspaceSnapshots: [{ cwd: message.payload.cwd, skills: discoveredSkills }] })) } } })); return;
+        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, ...(faults.providerLevelSkills ? { skills: discoveredSkills } : { workspaceSnapshots: [{ cwd: message.payload.cwd, skills: discoveredSkills }] }) })) } } })); return;
       }
       if (message.tag === "server.getSettings" || message.tag === "server.getConfig") {
         socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: message.tag === "server.getSettings" ? settings : { providers } } })); return;
@@ -292,9 +292,16 @@ test("a temporary empty skill refresh does not pause the next workflow stage", a
   assert.equal(f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)), false);
 });
 
+test("provider-level skill inventory starts a required workflow", async t => {
+  const f = await fixture(t);
+  f.faults.providerLevelSkills = true;
+  await f.send(delegation()); await f.tick();
+  assert.ok(f.commands.some(command => command.type === "thread.turn.start"));
+});
+
 test("a paused stage resumes when its required T3Code skill becomes available", async t => {
   const f = await fixture(t);
-  f.faults.emptySkillRefreshes = 3;
+  f.faults.emptySkillRefreshes = 6;
   await f.send(delegation());
   for (let i = 0; i < 8 && !f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)); i++) await f.tick(1);
   assert.equal(f.commands.some(command => command.type === "thread.turn.start"), false);
@@ -435,6 +442,33 @@ test("merged PR starts a fresh Retro session for the parent with prior thread co
   const retroTurn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
   assert.match(JSON.stringify(retroTurn), /Please use the \$retro skill to review all threads associated with this issue/);
   assert.match(JSON.stringify(retroTurn), new RegExp(first.threadId));
+});
+
+test("merged PR enters Retro when Linear reuses the existing agent session", async t => {
+  const f = await fixture(t);
+  f.skills.push({ name: "retro", path: "/skills/retro/SKILL.md", enabled: true });
+  f.projectConfig.t3code.workflows[0].statuses.Retro = {
+    output: "comment", "new-thread": true, "required-skills": ["retro"],
+    prompt: "Please use the $retro skill to review all threads associated with this issue",
+  };
+  await f.send(delegation()); await f.tick();
+  const first = f.commands.find(c => c.type === "thread.create");
+  assert.ok(first);
+  f.issueOverrides["issue-1"] = { state: { id: "uat", name: "Ready for UAT", team: { id: "team-1" }, type: "started" }, delegate: null };
+  f.pr.headRefName = first.branch;
+  f.pr.state = "MERGED";
+  f.options.pullRequests.find = async (_route: unknown, branch: string) => branch === first.branch ? f.pr : null;
+  const event = { action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: first.branch } } };
+  await f.sendGithub(event, true, "99999999-9999-4999-8999-999999999998", "pull_request");
+  await f.tick(1);
+  await f.send({ type: "Issue", action: "update", organizationId: "workspace-1",
+    data: { id: "issue-1", updatedAt: "2026-09-25T20:00:00Z" }, updatedFrom: { stateId: "uat" } });
+  await f.tick(20);
+  const second = f.commands.filter(c => c.type === "thread.create").at(-1);
+  assert.ok(second);
+  assert.notEqual(second.threadId, first.threadId);
+  assert.ok(f.commands.some(c => c.type === "thread.turn.start" && c.threadId === second.threadId && JSON.stringify(c).includes("Please use the $retro skill")));
+  assert.equal(f.activities.some(a => a.content?.type === "error" && /PR .* is merged/.test(a.content.body)), false);
 });
 
 test("merged PR completes paginated child issues before the parent and retries a partial failure", async t => {
