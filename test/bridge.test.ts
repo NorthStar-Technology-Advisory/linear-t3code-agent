@@ -1706,6 +1706,43 @@ test("agent-managed workflow follows its status prompt without bridge publicatio
   assert.ok(!f.activities.some(a => a.content.type === "error" && /validation\/context report/.test(a.content.body)));
 });
 
+test("agent-managed Retro reports hide a trailing bare bridge result", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.implement = {
+    output: "agent-managed", prompt: "Use $retro to review this issue.",
+  };
+  await f.send(delegation()); await f.tick();
+  const turn = f.commands.find(c => c.type === "thread.turn.start");
+  const thread = f.threads.get(turn.threadId);
+  thread.latestTurn.state = "completed";
+  thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: "retro-complete", role: "assistant", turnId: thread.latestTurn.turnId,
+    text: `I reviewed the five threads and PR #23. This retrospective proposes no code changes.\n\n${JSON.stringify({ status: "complete", summary: "## Retrospective\n\n1. Strengthen Auth review.", validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}` });
+  await f.tick();
+  const response = f.activities.find(a => a.content.type === "response")?.content.body;
+  assert.match(response, /I reviewed the five threads and PR #23/);
+  assert.match(response, /## Retrospective\n\n1\. Strengthen Auth review/);
+  assert.doesNotMatch(response, /"status":"complete"|"context":/);
+});
+
+test("Retro comment output publishes a bare result summary without JSON", async t => {
+  const f = await fixture(t);
+  f.projectConfig.t3code.workflows[0].statuses.implement = {
+    output: "comment", prompt: "Use $retro to review this issue.",
+  };
+  await f.send(delegation()); await f.tick();
+  const turn = f.commands.find(c => c.type === "thread.turn.start");
+  const thread = f.threads.get(turn.threadId);
+  thread.latestTurn.state = "completed";
+  thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: "retro-result", role: "assistant", turnId: thread.latestTurn.turnId,
+    text: `I reviewed the five threads and PR #23.\n\n${JSON.stringify({ status: "complete", summary: "## NOR-329 retrospective\n\n1. Strengthen Auth review.", validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}` });
+  await f.tick(20);
+  assert.ok(f.comments.some(c => c.body.includes("## NOR-329 retrospective")));
+  assert.ok(f.activities.some(a => a.content.type === "response" && /NOR-329 retrospective/.test(a.content.body)));
+  assert.ok(!f.activities.some(a => /"status":"complete"|"context":/.test(a.content.body)));
+});
+
 test("external review preserves the implementation thread without starting a review turn", async t => {
   const f = await fixture(t);
   f.projectConfig.t3code.workflows[0].statuses.review = { output: "external-review", "new-thread": true, prompt: "Wait for CodeRabbit." };
