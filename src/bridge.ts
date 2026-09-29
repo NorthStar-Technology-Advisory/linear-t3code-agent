@@ -11,7 +11,7 @@ import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient, type IssueRevision } from "./linear-context.js";
 import { LinearRateLimitError } from "./linear.js";
 import { prepareCheckout, ticketBranch, git, type Route } from "./repository.js";
-import { workflowInstructions, deliveryResult } from "./delivery.js";
+import { workflowInstructions, deliveryResult, agentManagedResponse } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
@@ -938,7 +938,7 @@ export class Bridge {
         if (latest.state !== "running") {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
           if (session.stage!.output === "agent-managed") {
-            const readable = summary.replace(/<bridge-result>[\s\S]*?<\/bridge-result>/g, "").trim();
+            const readable = agentManagedResponse(summary);
             const excerpt = readable.length > 2_000 ? `${readable.slice(0, 2_000)}\n\nFull response is in the T3Code thread.` : readable;
             this.store.update(s => {
               const current = s.sessions[id];

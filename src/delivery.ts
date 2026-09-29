@@ -24,11 +24,32 @@ const ResultSchema = z.object({
   blockers: z.array(z.string()),
   context: z.object({ read: z.array(z.string()), summarized: z.array(z.string()), unavailable: z.array(z.string()) }),
 });
+function bareResult(text: string): { result: z.infer<typeof ResultSchema>; start: number } | undefined {
+  const starts = [...text.matchAll(/^\s*\{/gm)].map(match => match.index);
+  for (const start of starts.reverse()) {
+    let data: unknown;
+    try { data = JSON.parse(text.slice(start).trim()); } catch { continue; }
+    const parsed = ResultSchema.safeParse(data);
+    if (parsed.success) return { result: parsed.data, start };
+  }
+}
+export function agentManagedResponse(text: string): string {
+  const readable = text.replace(/<bridge-result>[\s\S]*?<\/bridge-result>/g, "").trim();
+  const bare = bareResult(readable);
+  if (bare) {
+    const introduction = readable.slice(0, bare.start).trim();
+    const summary = bare.result.summary.trim();
+    return introduction && introduction !== summary ? `${introduction}\n\n${summary}` : summary || introduction;
+  }
+  return readable;
+}
 export function deliveryResult(text: string, output: Stage["output"] = "draft-pr") {
   const planning = output !== "draft-pr";
   const block = /<bridge-result>([\s\S]*?)<\/bridge-result>/.exec(text);
   let data: unknown;
-  try { data = JSON.parse(block?.[1] ?? ""); } catch { /* Missing evidence is an incomplete result. */ }
+  if (block) {
+    try { data = JSON.parse(block[1]!); } catch { /* Invalid evidence is an incomplete result. */ }
+  } else data = bareResult(text)?.result;
   const parsed = ResultSchema.safeParse(data);
   if (!parsed.success) return { complete: false, body: `Incomplete: T3Code did not supply a valid validation/context report.\n\n${text || "No result summary was supplied."}` };
   const result = parsed.data;
