@@ -47,21 +47,31 @@ export class T3CodeRunner implements Runner {
   }
 
   async skill(name: string, repository: string, instanceId: string): Promise<string> {
-    const skillSchema = z.object({ name: z.string(), path: z.string(), enabled: z.boolean(), userInvocable: z.boolean().optional() });
+    const skillSchema = z.object({ name: z.string(), path: z.string(), scope: z.string().optional(), enabled: z.boolean(), userInvocable: z.boolean().optional() });
     const responseSchema = z.object({ providers: z.array(z.object({ instanceId: z.string(), skills: z.array(skillSchema).optional(), workspaceSnapshots: z.array(z.object({ cwd: z.string(), skills: z.array(skillSchema) })).optional() })) });
     // Provider refresh can briefly return an incomplete workspace inventory.
     // Confirm an apparent miss before treating a required skill as unavailable.
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = responseSchema.safeParse(await this.rpc("server.refreshProviders"));
-      const provider = result.success ? result.data.providers.find(p => p.instanceId === instanceId) : undefined;
-      let skills = provider?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills ?? provider?.skills;
-      if (!skills) {
+      let provider = result.success ? result.data.providers.find(p => p.instanceId === instanceId) : undefined;
+      let workspace = provider?.workspaceSnapshots?.find(w => w.cwd === repository);
+      if (!workspace && !provider?.skills?.some(s => s.name === name)) {
         const scoped = responseSchema.safeParse(await this.rpc("server.refreshProviders", { instanceId, cwd: repository }));
-        skills = scoped.success ? scoped.data.providers.find(p => p.instanceId === instanceId)?.workspaceSnapshots?.find(w => w.cwd === repository)?.skills : undefined;
+        const refreshed = scoped.success ? scoped.data.providers.find(p => p.instanceId === instanceId) : undefined;
+        if (refreshed) provider = refreshed;
+        workspace = provider?.workspaceSnapshots?.find(w => w.cwd === repository);
       }
+      const skills = workspace?.skills ?? provider?.skills;
       const matches = skills?.filter(s => s.name === name && s.enabled && s.userInvocable !== false) ?? [];
       if (matches.length === 1) return matches[0]!.path;
       if (matches.length > 1) break;
+      // Before a thread exists, T3Code may have no snapshot for its repository.
+      // A user-scoped skill discovered elsewhere is portable across workspaces.
+      if (!workspace && !skills?.some(s => s.name === name)) {
+        const portable = provider?.workspaceSnapshots?.flatMap(w => w.skills.filter(s => s.name === name && s.scope === "user")) ?? [];
+        if (portable.length && portable.every(s => s.enabled && s.userInvocable !== false) && new Set(portable.map(s => s.path)).size === 1) return portable[0]!.path;
+        if (new Set(portable.map(s => s.path)).size > 1) break;
+      }
       if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1_000));
     }
     throw new IntegrationError(`Workflow skill ${name} is unavailable or ambiguous for ${instanceId} in ${repository}. Install/enable it in the T3Code execution environment, verify workspace skill discovery, then send resume. The bridge does not install skills.`, false);
