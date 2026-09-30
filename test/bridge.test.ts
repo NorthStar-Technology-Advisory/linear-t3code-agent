@@ -65,7 +65,7 @@ async function fixture(t: TestContext) {
   const artifactWrites: any[] = [];
   const comments: any[] = [];
   const relations: any[] = [];
-  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false, emptySkillRefreshes: 0, providerLevelSkills: false };
+  const faults = { dropArtifact: false, dropAfterPreparation: false, dropAcceptedTurn: false, rejectBeforeTurn: false, linearDown: false, dropActivity: false, snapshotDown: false, deferStop: false, deferResponses: false, snapshotDenied: false, replayFallback: false, rejectAnswer: false, mergeChildPageSize: 100, failMergedIssueId: "", rateLimitIssueReads: false, emptySkillRefreshes: 0, providerLevelSkills: false, unrelatedWorkspaceSkills: false, ambiguousUserSkills: false };
   const pr: PullRequest = { number: 42, url: "https://github.com/test/repo/pull/42", state: "OPEN", isDraft: true, headRefName: "" };
   const external = createServer(async (req, res) => {
     let raw = "";
@@ -215,7 +215,13 @@ async function fixture(t: TestContext) {
       if (message.tag === "server.refreshProviders") {
         const discoveredSkills = faults.emptySkillRefreshes > 0 ? [] : skills;
         if (faults.emptySkillRefreshes > 0) faults.emptySkillRefreshes--;
-        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, ...(faults.providerLevelSkills ? { skills: discoveredSkills } : { workspaceSnapshots: [{ cwd: message.payload.cwd, skills: discoveredSkills }] }) })) } } })); return;
+        const inventory = faults.unrelatedWorkspaceSkills
+          ? { skills: [], workspaceSnapshots: [
+            { cwd: "/other-workspace", skills: discoveredSkills.map(skill => ({ ...skill, scope: "user" })) },
+            ...(faults.ambiguousUserSkills ? [{ cwd: "/another-workspace", skills: discoveredSkills.map(skill => ({ ...skill, scope: "user", path: `/different/${skill.name}/SKILL.md` })) }] : []),
+          ] }
+          : faults.providerLevelSkills ? { skills: discoveredSkills } : { workspaceSnapshots: [{ cwd: message.payload.cwd, skills: discoveredSkills }] };
+        socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { providers: providers.map(p => ({ ...p, ...inventory })) } } })); return;
       }
       if (message.tag === "server.getSettings" || message.tag === "server.getConfig") {
         socket.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: message.tag === "server.getSettings" ? settings : { providers } } })); return;
@@ -297,6 +303,23 @@ test("provider-level skill inventory starts a required workflow", async t => {
   f.faults.providerLevelSkills = true;
   await f.send(delegation()); await f.tick();
   assert.ok(f.commands.some(command => command.type === "thread.turn.start"));
+});
+
+test("user skill in another workspace starts a new repository workflow", async t => {
+  const f = await fixture(t);
+  f.faults.unrelatedWorkspaceSkills = true;
+  await f.send(delegation()); await f.tick();
+  assert.ok(f.commands.some(command => command.type === "thread.turn.start"));
+  assert.equal(f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)), false);
+});
+
+test("conflicting user skill paths remain ambiguous", async t => {
+  const f = await fixture(t);
+  f.faults.unrelatedWorkspaceSkills = true;
+  f.faults.ambiguousUserSkills = true;
+  await f.send(delegation()); await f.tick();
+  assert.equal(f.commands.some(command => command.type === "thread.turn.start"), false);
+  assert.ok(f.activities.some(activity => activity.content.type === "error" && /Workflow skill/.test(activity.content.body)));
 });
 
 test("a paused stage resumes when its required T3Code skill becomes available", async t => {
