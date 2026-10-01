@@ -17,6 +17,7 @@ import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
 import { GitHubReviewSchema, GitHubMergeSchema, isActionableCodeRabbitReview, type GitHubReview, type GitHubMerge, type GitHubReviews } from "./github-review.js";
 import { createHash } from "node:crypto";
+import { sweepDependencies, sweepReport } from "./dependency-sweep.js";
 
 const WebhookSchema = z.object({
   action: z.enum(["created", "prompted"]), organizationId: z.string().min(1),
@@ -51,9 +52,12 @@ type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: 
 type Undeliverable = Outbound & { failedAt: string; reason: "session archived" };
 type QueuedGitHubReview = GitHubReview & { handoffIssued?: boolean };
 type Retirement = { id: string; sessionId: string; issueId: string; route: Route; branch: string; worktree: string; mergedPr: PullRequest; stops: Record<string, RunnerCommand>; nextAttemptAt?: number; lastReport?: string };
-type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[]; githubMerges?: GitHubMerge[]; retirements?: Retirement[] };
+type DependencySweep = { id: string; sessionId: string; stop?: RunnerCommand };
+type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[]; githubMerges?: GitHubMerge[]; retirements?: Retirement[]; dependencySweeps?: DependencySweep[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
+  dependencySweepRoot?: string; dependencySweepGraceMs?: number;
+  dependencySweepProcessPaths?: () => Promise<string[]>;
   pullRequests: PullRequests; prPollMs: number;
   githubReviews?: GitHubReviews;
   concurrency: number; runner: Runner; linear: LinearClient;
@@ -319,6 +323,7 @@ export class Bridge {
         }
       }
     }
+    await this.processDependencySweeps();
     await this.recoverAvailableSkills();
     let running = Object.values(this.store.read().sessions).filter(s => (s.active || s.status === "running" || s.status === "cancelling")).length;
     const eligible: string[] = [];
@@ -354,6 +359,11 @@ export class Bridge {
   }
   private scheduleRetirement(state: State, session: Session) {
     if (!session.stage?.retrospective) return;
+    if (this.options.dependencySweepRoot) {
+      const existing = state.dependencySweeps?.find(job => job.sessionId === session.id);
+      if (existing) delete existing.stop;
+      else (state.dependencySweeps ??= []).push({ id: randomUUID(), sessionId: session.id });
+    }
     const related = Object.values(state.sessions).filter(other => other.issueId === session.issueId && other.workspaceId === session.workspaceId);
     const mergedPr = session.mergedPr ?? related.map(other => other.pr ?? other.mergedPr).find(pr => pr?.state === "MERGED");
     if (!mergedPr || mergedPr.state !== "MERGED") return;
@@ -369,6 +379,40 @@ export class Bridge {
       (state.retirements ??= []).push({ id: randomUUID(), sessionId: session.id, issueId: session.issueId,
         route: structuredClone(other.route), branch: other.branch, worktree: other.worktree,
         mergedPr: structuredClone(mergedPr), stops: {} });
+    }
+  }
+  private async processDependencySweeps() {
+    if (!this.options.dependencySweepRoot) return;
+    for (const job of this.store.read().dependencySweeps ?? []) {
+      const state = this.store.read();
+      const session = state.sessions[job.sessionId];
+      // The findings must reach Linear before maintenance starts. New questions
+      // and follow-ups take priority over the pending sweep.
+      if (!session || ["paused", "cancelled", "cancelling", "running"].includes(session.status) || state.outbox.some(entry => entry.sessionId === job.sessionId) || session.active || session.command || session.publication || session.queue.length || session.requests.length || session.responses.length) continue;
+      try {
+        const snapshot = await this.options.runner.snapshot(session.threadId);
+        if (snapshot?.thread.latestTurn?.state === "running") continue;
+        if (snapshot?.thread.session && snapshot.thread.session.status !== "stopped") {
+          const stop = job.stop ?? { type: "thread.session.stop", commandId: randomUUID(), threadId: session.threadId, createdAt: new Date().toISOString() };
+          this.store.update(current => { current.dependencySweeps!.find(entry => entry.id === job.id)!.stop = stop; });
+          await this.options.runner.dispatch(stop);
+          continue;
+        }
+      } catch { continue; /* Keep the durable job until originating execution is verifiably stopped. */ }
+      const result = await sweepDependencies({
+        root: this.options.dependencySweepRoot,
+        graceMs: this.options.dependencySweepGraceMs ?? 7 * 24 * 60 * 60 * 1000,
+        inventory: () => this.options.runner.workspaceInventory(),
+        processPaths: this.options.dependencySweepProcessPaths,
+        protectedPaths: () => Object.values(this.store.read().sessions).filter(owner =>
+          // Idle, paused and cancelled are resumable states, not retirement evidence.
+          !owner.workspaceRetired && (owner.status !== "closed" || owner.active || owner.command || owner.publication || owner.queue.length || owner.requests.length || owner.responses.length)
+        ).flatMap(owner => owner.worktree ? [owner.worktree] : []),
+      });
+      this.store.update(current => {
+        this.report(current, current.sessions[job.sessionId], "thought", sweepReport(result));
+        current.dependencySweeps = current.dependencySweeps!.filter(entry => entry.id !== job.id);
+      });
     }
   }
   private async processRetirements() {

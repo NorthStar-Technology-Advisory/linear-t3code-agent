@@ -27,3 +27,10 @@ test("public configuration omits credentials and private instance connection det
   assert.equal(result.publicConfig.maxConcurrentSessions, 1);
   assert.doesNotMatch(JSON.stringify(result.publicConfig), /private-t3-token|localhost|secret|webhook/);
 });
+test("dependency sweep has a global home root, seven-day grace and an explicit disable switch", async () => {
+  const result = await loadConfig();
+  assert.ok(result.config.DEPENDENCY_SWEEP_ROOT.endsWith("/.t3/worktrees"));
+  assert.equal(result.config.DEPENDENCY_SWEEP_GRACE_DAYS, 7);
+  assert.equal((await loadConfig({ DEPENDENCY_SWEEP_ROOT: "" })).config.DEPENDENCY_SWEEP_ROOT, "");
+  await assert.rejects(loadConfig({ DEPENDENCY_SWEEP_GRACE_DAYS: "0" }));
+});

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { homedir } from "node:os";
+import path from "node:path";
 const emptyStringAsUndefined = (value: unknown) => value === "" ? undefined : value;
 const serviceUrl = z.string().url().refine(value => {
   const url = new URL(value);
@@ -12,6 +14,8 @@ export const ConfigSchema = z.object({
   T3CODE_URL: serviceUrl, T3CODE_TOKEN: z.string().min(1),
   BRIDGE_DB_PATH: z.string().default("./data/bridge.sqlite"),
   WORKTREE_ROOT: z.string().default("./data/worktrees"),
+  DEPENDENCY_SWEEP_ROOT: z.string().refine(value => value === "" || path.isAbsolute(value), "must be an absolute local directory or empty to disable").default(path.join(homedir(), ".t3", "worktrees")),
+  DEPENDENCY_SWEEP_GRACE_DAYS: z.coerce.number().int().min(7).default(7),
   MAX_CONCURRENT_SESSIONS: z.coerce.number().int().positive().default(1),
   POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
   PR_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
