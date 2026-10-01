@@ -174,6 +174,8 @@ if (process.env.NODE_ENV !== "test") {
   process.umask(0o077);
   const bridge = new Bridge({
     databasePath: config.BRIDGE_DB_PATH, worktreeRoot: config.WORKTREE_ROOT,
+    dependencySweepRoot: config.DEPENDENCY_SWEEP_ROOT || undefined,
+    dependencySweepGraceMs: config.DEPENDENCY_SWEEP_GRACE_DAYS * 24 * 60 * 60 * 1000,
     concurrency: config.MAX_CONCURRENT_SESSIONS, runner: new T3CodeRunner(config.T3CODE_URL, config.T3CODE_TOKEN),
     linear: new LinearClient(), pullRequests: new GitHubPullRequests(), githubReviews: new GitHubReviewClient(), pollMs: config.POLL_INTERVAL_MS,
     prPollMs: config.PR_POLL_INTERVAL_MS, heartbeatMs: config.PROGRESS_HEARTBEAT_MS, progressDebounceMs: config.PROGRESS_DEBOUNCE_MS,

@@ -1863,6 +1863,65 @@ for (const output of ["comment", "agent-managed"] as const) test(`an incomplete 
 
 async function accessWorkspace(workspace: string) { await realpath(workspace); }
 
+async function addGlobalSweepWorkspace(f: Awaited<ReturnType<typeof fixture>>) {
+  const root = path.join(f.root, "global-worktrees");
+  const otherRepo = path.join(f.root, "other-source");
+  const folder = path.join(root, "unrelated-project", "old-worktree");
+  await mkdir(otherRepo); await mkdir(path.dirname(folder), { recursive: true });
+  execFileSync("git", ["init", "-b", "main", otherRepo], { stdio: "pipe" });
+  await writeFile(path.join(otherRepo, ".gitignore"), "node_modules/\n");
+  execFileSync("git", ["-C", otherRepo, "add", "."]);
+  execFileSync("git", ["-C", otherRepo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "Initial"], { stdio: "pipe" });
+  execFileSync("git", ["-C", otherRepo, "worktree", "add", "-b", "old", folder], { stdio: "pipe" });
+  const target = path.join(folder, "node_modules"); await mkdir(target); await writeFile(path.join(target, "dep.js"), "Dependency");
+  f.projects.push({ ...f.projects[0], id: "other-project", title: "Other project", workspaceRoot: otherRepo });
+  f.threads.set("historical-owner", { id: "historical-owner", projectId: "other-project", branch: "old", worktreePath: folder, messages: [], activities: [], latestTurn: null,
+    deletedAt: "2020-01-01T00:00:00Z", updatedAt: "2020-01-01T00:00:00Z", session: { status: "stopped", activeTurnId: null, lastError: null } });
+  Object.assign(f.options, { dependencySweepRoot: root, dependencySweepProcessPaths: async () => [] });
+  return { folder, target };
+}
+
+test("completed Retro durably sweeps an unrelated project's worktree after handover and provider stop", async t => {
+  const { f, retro } = await startMergedRetro(t, "agent-managed", true);
+  const other = await addGlobalSweepWorkspace(f);
+  f.faults.deferStop = true;
+  completeRetro(retro, "Full retrospective findings and next actions."); await f.tick(6);
+  assert.ok(f.activities.some(activity => activity.content.body.includes("Full retrospective findings")));
+  await accessWorkspace(other.target);
+  await f.restart(); f.faults.deferStop = false;
+  retro.session = { status: "stopped", activeTurnId: null, lastError: null };
+  await f.tick(12);
+  await assert.rejects(accessWorkspace(other.target)); await accessWorkspace(other.folder);
+  const reports = f.activities.filter(activity => activity.content.body.includes("Retro dependency sweep:"));
+  assert.equal(reports.length, 1); assert.match(reports[0].content.body, /removed 1 node_modules/);
+  assert.ok(reports[0].content.body.includes(other.folder));
+  await f.restart(); await f.tick(4);
+  assert.equal(f.activities.filter(activity => activity.content.body.includes("Retro dependency sweep:")).length, 1);
+});
+
+test("Retro sweep waits for a delivered handover and runs independently of a merged PR", async t => {
+  const f = await fixture(t); const other = await addGlobalSweepWorkspace(f);
+  f.projectConfig.t3code.workflows[0].statuses.Retro = { output: "agent-managed", prompt: "Use $retro to review." };
+  move(f, "Retro", "retro"); f.issueOverrides["issue-1"].state.name = "Retro";
+  await f.send(delegation()); await f.tick(12);
+  const retro = f.threads.get(f.commands.filter(command => command.type === "thread.turn.start").at(-1).threadId);
+  f.faults.linearDown = true;
+  completeRetro(retro, "Retrospective without an associated merged PR."); await f.tick(6);
+  await accessWorkspace(other.target);
+  f.faults.linearDown = false; await f.restart(); await f.tick(12);
+  await assert.rejects(accessWorkspace(other.target));
+  assert.ok(f.activities.some(activity => activity.content.body.includes("Retrospective without an associated merged PR")));
+  assert.ok(f.activities.some(activity => activity.content.body.includes("Retro dependency sweep:")));
+});
+
+test("incomplete Retro never schedules global dependency deletion", async t => {
+  const { f, retro } = await startMergedRetro(t, "agent-managed"); const other = await addGlobalSweepWorkspace(f);
+  completeRetro(retro, `<bridge-result>${JSON.stringify({ status: "incomplete", summary: "Required findings unavailable", blockers: ["Missing evidence"] })}</bridge-result>`);
+  await f.tick(12); await f.restart(); await f.tick(6);
+  await accessWorkspace(other.target);
+  assert.ok(!f.activities.some(activity => activity.content.body.includes("Retro dependency sweep:")));
+});
+
 test("external review preserves the implementation thread without starting a review turn", async t => {
   const f = await fixture(t);
   f.projectConfig.t3code.workflows[0].statuses.review = { output: "external-review", "new-thread": true, prompt: "Wait for CodeRabbit." };

@@ -22,9 +22,16 @@ export type ReplayResult = { events: Array<{ sequence: number; activity: RunnerA
 export type ModelSelection = { instanceId: string; model: string; [key: string]: unknown };
 export type RunnerProject = { id: string; title: string; workspaceRoot: string; deletedAt: string | null; defaultModelSelection: ModelSelection | null; defaultThreadEnvMode?: "local" | "worktree" | null };
 export type ProjectExecution = { modelSelection: ModelSelection; workspaceMode: "local" | "worktree"; startFromOrigin: boolean };
+export type WorkspaceOwner = {
+  id: string; projectId: string; worktreePath: string | null;
+  deletedAt?: string | null; archivedAt?: string | null; settledAt?: string | null; updatedAt?: string;
+  latestTurn: RunnerThread["latestTurn"]; session: RunnerThread["session"];
+};
+export type WorkspaceInventory = { projects: Array<{ id: string; workspaceRoot: string }>; threads: WorkspaceOwner[] };
 export interface Runner {
   skill(name: string, repository: string, instanceId: string): Promise<string>;
   projects(): Promise<RunnerProject[]>;
+  workspaceInventory(): Promise<WorkspaceInventory>;
   baseBranch(repository: string): Promise<string>;
   execution(project: RunnerProject): Promise<ProjectExecution>;
   snapshot(threadId: string): Promise<{ sequence: number; thread: RunnerThread } | null>;

@@ -188,6 +188,12 @@ For merged tickets entering Retro, cleanup waits until the complete retrospectiv
 
 Retro handovers include the full findings, with priority, evidence, impact, recommended changes, successes and outstanding decisions. Agent-managed Retro output is not shortened to a 2,000-character excerpt, and comment-based Retro output retains detailed prose even when the structured summary is brief. Long sidebar messages use the normal numbered activity chunks.
 
+Every completed Retro also queues a global dependency sweep. After the handover reaches Linear and the originating provider is confirmed stopped, it scans **all repository folders** beneath `DEPENDENCY_SWEEP_ROOT`, not just the issue being reviewed. This runs independently of whether that Retro has a merged PR, after the existing full-worktree retirement attempts. Pending sweeps survive bridge restarts; incomplete Retros do not schedule them.
+
+Automatic removal is limited to untracked `node_modules` directories in clean, registered worktrees where **every known T3 thread owner is deleted and stopped**, its terminal/activity dates are at least seven days old, and no bridge work or local process/open file uses the path. The inventory includes manually created, archived and deleted T3 threads. Settled/archived threads that could resume are reported for manual review: T3 currently has no shared cleanup reservation for manual launchers. Idle, paused, cancelled, active, recently used and unknown worktrees are preserved. Source checkouts, tracked dependencies, dirty work, nested checkouts, symlink targets and other files are preserved. Required inventory/process-check failures preserve files and appear in the report; the host must provide `lsof` and `ps` with visibility into local workspace processes.
+
+The sweep rechecks ownership and Git state, then detaches each approved cache before deleting it, so a later dependency install at the original path is preserved. Reactivation during the recheck restores the cache when the original path is available. A crash or failed restoration may retain a `.dependency-sweep-*` directory under the root; subsequent reports flag it for manual recovery rather than deleting it blindly. These checks do not provide a universal lock against an external launcher; resumable owners therefore remain review-only. Each Retro sidebar receives exact removed paths, preserved/review paths and errors. Reinstall dependencies from the lockfile before using a cleaned worktree again. `npkill` is not installed or invoked.
+
 Implementation delivery instructions fetch the actual PR target, integrate it into the session branch, resolve conflicts, rerun relevant checks and push normally before verifying GitHub mergeability. Ambiguous resolutions, failing checks and unavailable mergeability verification are reported as blockers. This runs on creation/update turns and follow-ups; it does not continuously monitor idle PRs for new conflicts or authorize merging a PR.
 
 ## Operations
@@ -196,6 +202,8 @@ Implementation delivery instructions fetch the actual PR target, integrate it in
 | --- | --- |
 | `BRIDGE_DB_PATH` | `./data/bridge.sqlite` |
 | `WORKTREE_ROOT` (context/attachment storage; T3Code places worktrees) | `./data/worktrees` |
+| `DEPENDENCY_SWEEP_ROOT` (absolute, canonical local worktree root; empty disables) | `~/.t3/worktrees` under the bridge user's home |
+| `DEPENDENCY_SWEEP_GRACE_DAYS` (minimum 7) | `7` |
 | `MAX_CONCURRENT_SESSIONS` | `1` |
 | `POLL_INTERVAL_MS` | `1000` |
 | `PR_POLL_INTERVAL_MS` | `60000` |

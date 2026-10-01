@@ -83,6 +83,19 @@ export class T3CodeRunner implements Runner {
     return parsed.data.projects;
   }
 
+  async workspaceInventory() {
+    // Include deleted/archived and manually created threads, not just bridge sessions.
+    const parsed = z.object({
+      projects: z.array(z.object({ id: z.string(), workspaceRoot: z.string() })),
+      threads: z.array(ThreadSchema.pick({ id: true, projectId: true, worktreePath: true, latestTurn: true, session: true }).extend({
+        deletedAt: z.string().nullable().optional(), archivedAt: z.string().nullable().optional(),
+        settledAt: z.string().nullable().optional(), updatedAt: z.string().optional(),
+      })),
+    }).safeParse(await this.request("/api/orchestration/snapshot"));
+    if (!parsed.success) throw new IntegrationError("T3Code workspace inventory unavailable; dependency cleanup must preserve all worktrees.", false);
+    return parsed.data;
+  }
+
   private async authenticatedSocket(): Promise<WebSocket> {
     const ticket = z.object({ ticket: z.string() }).safeParse(await this.request("/api/auth/websocket-ticket", undefined, true));
     if (!ticket.success) throw new IntegrationError("T3Code WebSocket ticket contract changed.", false);
