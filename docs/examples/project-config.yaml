@@ -52,3 +52,17 @@ t3code:
             Make the changes, run appropriate checks and open a draft
             pull request. Report validation results and any blockers.
             Follow-up feedback should update the same pull request.
+            Integrate the latest PR target branch, resolve merge conflicts,
+            rerun checks and push the resolution before verifying mergeability.
+
+        "Retro":
+          new-thread: true
+          output: comment
+          required-skills:
+            - retro
+          prompt: |
+            Use $retro to review all threads associated with this issue.
+            Give a detailed handover with each finding's priority, evidence,
+            impact and recommended action. Include what worked, unresolved
+            questions and the decisions needed next. Distinguish proposed
+            improvements from changes already applied.
