@@ -11,7 +11,7 @@ import type { Runner, RunnerCommand, RunnerThread } from "./runner.js";
 import { LinearClient, type IssueRevision } from "./linear-context.js";
 import { LinearRateLimitError } from "./linear.js";
 import { prepareCheckout, ticketBranch, git, type Route } from "./repository.js";
-import { workflowInstructions, deliveryResult, agentManagedResponse } from "./delivery.js";
+import { workflowInstructions, deliveryResult, agentManagedResponse, agentManagedComplete } from "./delivery.js";
 import { cleanupWorktree, type PullRequests, type PullRequest } from "./pull-requests.js";
 import { IntegrationError } from "./t3code-runner.js";
 import { redact } from "./progress.js";
@@ -40,6 +40,7 @@ type Session = {
   queue: QueuedTurn[]; command?: RunnerCommand;
   pendingProgress?: string; lastProgress?: string;
   pr?: PullRequest; lastPrCheckAt?: number; cleanup?: string;
+  mergedPr?: PullRequest; workspaceRetired?: boolean;
   requests: PendingRequest[]; responses: RunnerCommand[];
   generation: number; cancelHadActive?: boolean; cancelCommand?: RunnerCommand; interrupted?: boolean; stopSent?: boolean;
   created: boolean; workspaceRequested?: boolean; bootstrapRecoveryPending?: boolean; active?: { issueRevisions?: Record<string, IssueRevision>; messageId: string; turnId?: string; previousTurnId?: string };
@@ -49,7 +50,8 @@ type Session = {
 type Outbound = { issueId?: string; attempted?: boolean; id: string; sessionId: string; type: "thought" | "error" | "response" | "elicitation"; body: string };
 type Undeliverable = Outbound & { failedAt: string; reason: "session archived" };
 type QueuedGitHubReview = GitHubReview & { handoffIssued?: boolean };
-type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[]; githubMerges?: GitHubMerge[] };
+type Retirement = { id: string; sessionId: string; issueId: string; route: Route; branch: string; worktree: string; mergedPr: PullRequest; stops: Record<string, RunnerCommand>; nextAttemptAt?: number; lastReport?: string };
+type State = { workspaceId?: string; sessions: Record<string, Session>; deliveries: string[]; outbox: Outbound[]; undeliverable?: Undeliverable[]; githubReviews?: QueuedGitHubReview[]; githubMerges?: GitHubMerge[]; retirements?: Retirement[] };
 export type BridgeOptions = {
   databasePath: string; worktreeRoot: string;
   pullRequests: PullRequests; prPollMs: number;
@@ -284,6 +286,7 @@ export class Bridge {
   private async work() {
     await this.processGitHubMerges();
     await this.processGitHubReviews();
+    await this.processRetirements();
     const failedSessions = new Set<string>();
     for (const outgoing of this.store.read().outbox) {
       if (failedSessions.has(outgoing.sessionId)) continue;
@@ -349,6 +352,78 @@ export class Bridge {
       }
     }));
   }
+  private scheduleRetirement(state: State, session: Session) {
+    if (!session.stage?.retrospective) return;
+    const related = Object.values(state.sessions).filter(other => other.issueId === session.issueId && other.workspaceId === session.workspaceId);
+    const mergedPr = session.mergedPr ?? related.map(other => other.pr ?? other.mergedPr).find(pr => pr?.state === "MERGED");
+    if (!mergedPr || mergedPr.state !== "MERGED") return;
+    for (const other of related) {
+      if (other.route?.workspaceMode !== "worktree" || !other.worktree || other.workspaceRetired) continue;
+      const existing = state.retirements?.find(job => job.worktree === other.worktree && job.route.repository === other.route!.repository);
+      if (existing) {
+        // A follow-up may have restarted the same provider after a blocked
+        // cleanup. Its new completed turn needs new stop command identities.
+        existing.stops = {}; delete existing.nextAttemptAt;
+        continue;
+      }
+      (state.retirements ??= []).push({ id: randomUUID(), sessionId: session.id, issueId: session.issueId,
+        route: structuredClone(other.route), branch: other.branch, worktree: other.worktree,
+        mergedPr: structuredClone(mergedPr), stops: {} });
+    }
+  }
+  private async processRetirements() {
+    for (const job of this.store.read().retirements ?? []) {
+      if ((job.nextAttemptAt ?? 0) > Date.now()) continue;
+      const users = Object.values(this.store.read().sessions).filter(session => session.route?.repository === job.route.repository && session.worktree === job.worktree);
+      // A queued follow-up or a stage transition still owns the files. Retire only
+      // after its complete handover, never concurrently with coding/publication.
+      if (users.some(session => session.active || session.command || session.publication || session.queue.length || session.status === "cancelling" || session.status === "running" || session.status === "paused" || session.status === "cancelled")) continue;
+      let outcome: string;
+      try {
+        const pr = await this.options.pullRequests.find(job.route, job.mergedPr.headRefName);
+        if (!pr || pr.state !== "MERGED" || pr.url !== job.mergedPr.url || pr.number !== job.mergedPr.number || pr.headRefName !== job.mergedPr.headRefName) throw new Error("Merged PR identity could not be verified.");
+        const threads = [...new Set(users.flatMap(session => [session.threadId, ...(session.previousThreads ?? []).map(thread => thread.threadId)]))];
+        let stopped = true;
+        for (const threadId of threads) {
+          const snapshot = await this.options.runner.snapshot(threadId);
+          if (!snapshot) continue;
+          const thread = snapshot.thread;
+          if (thread.worktreePath !== job.worktree && !users.some(session => session.threadId === threadId)) continue;
+          if (thread.projectId !== job.route.t3ProjectId || thread.branch !== job.branch || thread.worktreePath !== job.worktree) throw new Error("Saved thread workspace identity changed.");
+          if (!thread.session || thread.session.status === "stopped") {
+            if (thread.latestTurn?.state === "running") throw new Error("Thread still reports a running turn.");
+            continue;
+          }
+          stopped = false;
+          const command = job.stops[threadId] ?? { type: "thread.session.stop", commandId: randomUUID(), threadId, createdAt: new Date().toISOString() };
+          this.store.update(state => { state.retirements!.find(entry => entry.id === job.id)!.stops[threadId] = command; });
+          await this.options.runner.dispatch(command);
+        }
+        if (!stopped) continue;
+        outcome = await cleanupWorktree(job.route, job.worktree, pr, job.branch, () => !Object.values(this.store.read().sessions).some(session =>
+          session.route?.repository === job.route.repository && session.worktree === job.worktree &&
+          (session.active || session.command || session.publication || session.queue.length || session.status === "cancelling" || session.status === "running" || session.status === "paused" || session.status === "cancelled")));
+      } catch {
+        outcome = "Worktree preserved: retirement could not verify the merged PR, stopped providers or clean, published Git state. Cleanup will retry.";
+      }
+      this.store.update(state => {
+        const current = state.retirements!.find(entry => entry.id === job.id)!;
+        const removed = outcome.startsWith("Clean,") || outcome.startsWith("Worktree already removed");
+        if (current.lastReport !== outcome) this.report(state, state.sessions[job.sessionId], "thought", `Post-merge cleanup: ${outcome}`);
+        if (removed) {
+          for (const session of Object.values(state.sessions)) {
+            if (session.route?.repository !== job.route.repository || session.worktree !== job.worktree) continue;
+            session.cleanup = outcome; session.workspaceRetired = true;
+            session.mergedPr = structuredClone(job.mergedPr);
+          }
+          state.retirements = state.retirements!.filter(entry => entry.id !== job.id);
+        } else {
+          current.lastReport = outcome;
+          current.nextAttemptAt = Date.now() + this.options.prPollMs;
+        }
+      });
+    }
+  }
   private async processGitHubMerges() {
     if (!this.options.githubReviews) return;
     for (const event of this.store.read().githubMerges ?? []) {
@@ -387,7 +462,12 @@ export class Bridge {
           if (child.parent?.id === issue.id) await markRetro(child, null);
         }
         await markRetro(issue, appUserId);
-        this.store.update(state => { state.sessions[session.id]!.pr = matchedPrs.get(session.id)!; });
+        this.store.update(state => {
+          state.sessions[session.id]!.pr = matchedPrs.get(session.id)!;
+          for (const related of Object.values(state.sessions)) {
+            if (related.issueId === session.issueId && related.workspaceId === session.workspaceId) related.mergedPr = matchedPrs.get(session.id)!;
+          }
+        });
         this.dropGitHubMerge(event);
       } catch (error) {
         this.mergeRetryAt.set(key, Date.now() + this.options.prPollMs);
@@ -492,12 +572,14 @@ export class Bridge {
     this.store.update(s => { s.sessions[session.id].lastPrCheckAt = Date.now(); if (pr) s.sessions[session.id].pr = pr; });
     if (!pr || pr.state === "OPEN") return false;
     // If closure happens during a turn, stop execution before any cleanup.
-    if (session.active) {
+    const provider = session.created ? await this.options.runner.snapshot(session.threadId) : null;
+    if (this.session(session.id).generation !== session.generation) return true;
+    if (session.active || (provider?.thread.session && provider.thread.session.status !== "stopped")) {
       this.store.update(s => { const current = s.sessions[session.id]; this.requestCancellation(current); });
       return true;
     }
     let cleanup: string;
-    try { cleanup = session.route.workspaceMode === "local" ? "Current checkout files and branch preserved; reservation released." : session.worktree ? await cleanupWorktree(session.route, session.worktree) : "No verified worktree path; files preserved for manual inspection."; }
+    try { cleanup = session.route.workspaceMode === "local" ? "Current checkout files and branch preserved; reservation released." : session.worktree ? await cleanupWorktree(session.route, session.worktree, pr.state === "MERGED" ? pr : undefined, session.branch) : "No verified worktree path; files preserved for manual inspection."; }
     catch { cleanup = "Worktree preserved: cleanup could not verify clean, fully pushed state. Check git access before manual cleanup."; }
     if (this.session(session.id).generation !== session.generation) return true;
     this.store.update(s => {
@@ -654,6 +736,30 @@ export class Bridge {
     let session = this.session(id);
     if (session.status === "cancelling") { await this.cancel(session); return; }
     if (session.supersededBy || session.status === "closed") return;
+    if (session.workspaceRetired) {
+      if (!session.queue.length) return;
+      const issue = await this.options.linear.issue(session.issueId);
+      if (!issue.delegated || issue.state.name !== "Retro") {
+        this.store.update(state => {
+          const current = state.sessions[id]; current.status = "closed"; current.queue = [];
+          this.report(state, current, "error", "The merged ticket workspace has been retired. Use a new Linear ticket for further implementation.");
+        });
+        return;
+      }
+      // A later retrospective question gets a fresh disposable workspace; the
+      // previous conversation/branch remain in the ledger, with no missing-path reuse.
+      this.store.update(state => {
+        const current = state.sessions[id];
+        (current.previousThreads ??= []).push({ threadId: current.threadId, created: current.created, sequence: current.sequence, seenActivities: current.seenActivities });
+        current.threadId = randomUUID();
+        current.branch = `${ticketBranch(issue.identifier, issue.title)}-retro-${current.threadId.slice(0, 8)}`;
+        current.worktree = null; current.created = false; current.workspaceRetired = false;
+        current.sequence = 0; current.seenActivities = [];
+        delete current.pr; delete current.stage; delete current.gate; delete current.cleanup;
+        delete current.workspaceRequested; delete current.bootstrapRecoveryPending;
+      });
+      session = this.session(id);
+    }
     if (session.pr && Date.now() - (session.lastPrCheckAt ?? 0) >= this.options.prPollMs) {
       let retro = false;
       if (session.pr.state !== "OPEN") {
@@ -746,7 +852,9 @@ export class Bridge {
         .filter(other => other.id !== id && other.workspaceId === session.workspaceId && other.issueId === session.issueId && other.route)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (predecessor) {
-        postMergeRetro = gateIssue.state.name === "Retro" && selectedStatus?.output === "comment" && predecessor.pr?.state === "MERGED";
+        const mergedPr = predecessor.mergedPr ?? predecessor.pr;
+        postMergeRetro = gateIssue.state.name === "Retro" && (selectedStatus?.output === "comment" || selectedStatus?.output === "agent-managed") && mergedPr?.state === "MERGED";
+        if (postMergeRetro) this.store.update(state => { state.sessions[id].mergedPr = structuredClone(mergedPr); });
         if ((predecessor.cleanup || (predecessor.pr && predecessor.pr.state !== "OPEN")) && !postMergeRetro) throw new IntegrationError("This ticket's PR has closed or merged. Its workspace is retired; create a new Linear ticket for further work.", false);
         if (!postMergeRetro) {
           if (predecessor.route!.workspaceMode !== "worktree") throw new IntegrationError("This ticket uses a legacy current checkout. Preserve its changes and finish it before starting a new ticket with an isolated worktree.", false);
@@ -819,7 +927,8 @@ export class Bridge {
         }
         current.artifactParentId = gateIssue.parent?.id ?? gateIssue.id;
         current.stage = { id: randomUUID(), output: settings.output, statusId: gateIssue.state.id, teamId: gateIssue.team.id,
-          prompt: settings.prompt, instructions: projectConfig!.instructions, skills };
+          prompt: settings.prompt, instructions: projectConfig!.instructions, skills,
+          retrospective: gateIssue.state.name === "Retro" || skills.some(skill => skill.name === "retro") || /\$retro\b/.test(settings.prompt) };
       });
       session = this.session(id);
     }
@@ -926,6 +1035,7 @@ export class Bridge {
           delete current.publication; delete current.active; delete current.command;
           current.status = current.queue.length ? "queued" : "idle";
           this.report(s, current, "response", `${publication.report}\n\nLinear artifacts published. ${publication.review.join("\n")}\nWaiting for human direction; status unchanged.`);
+          this.scheduleRetirement(s, current);
         }
       });
       return;
@@ -939,17 +1049,19 @@ export class Bridge {
           const summary = snapshot.thread.messages.filter(m => m.role === "assistant" && m.turnId === latest.turnId).map(m => m.text).join("\n\n");
           if (session.stage!.output === "agent-managed") {
             const readable = agentManagedResponse(summary);
-            const excerpt = readable.length > 2_000 ? `${readable.slice(0, 2_000)}\n\nFull response is in the T3Code thread.` : readable;
+            const excerpt = !session.stage!.retrospective && readable.length > 2_000 ? `${readable.slice(0, 2_000)}\n\nFull response is in the T3Code thread.` : readable;
+            const complete = latest.state === "completed" && (!session.stage!.retrospective || agentManagedComplete(summary));
             this.store.update(s => {
               const current = s.sessions[id];
               delete current.active; delete current.command;
-              current.status = latest.state === "completed" && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
-              this.report(s, current, latest.state === "completed" ? "response" : "error", excerpt || `T3Code turn ${latest.state}.`);
+              current.status = complete && !paused ? (current.queue.length ? "queued" : "idle") : "paused";
+              this.report(s, current, complete ? "response" : "error", excerpt || `T3Code turn ${latest.state}.`);
+              if (complete && !paused) this.scheduleRetirement(s, current);
             });
             return;
           }
           const planning = session.stage!.output !== "draft-pr";
-          const result = deliveryResult(summary, session.stage!.output);
+          const result = deliveryResult(summary, session.stage!.output, session.stage!.retrospective);
           if (planning && result.complete && latest.state === "completed") {
             if (paused) return;
             const issue = await this.options.linear.issue(session.issueId);

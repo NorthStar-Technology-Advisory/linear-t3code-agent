@@ -1766,6 +1766,103 @@ test("Retro comment output publishes a bare result summary without JSON", async 
   assert.ok(!f.activities.some(a => /"status":"complete"|"context":/.test(a.content.body)));
 });
 
+async function startMergedRetro(t: TestContext, output: "comment" | "agent-managed", fresh = false) {
+  const f = await fixture(t);
+  const origin = path.join(f.root, "origin.git");
+  execFileSync("git", ["init", "--bare", origin], { stdio: "pipe" });
+  execFileSync("git", ["-C", f.repo, "remote", "add", "origin", origin]);
+  execFileSync("git", ["-C", f.repo, "push", "origin", "main"], { stdio: "pipe" });
+  f.projectConfig.t3code.workflows[0].statuses.Retro = { output, "new-thread": true, prompt: "Use $retro to review this issue." };
+  await f.send(delegation()); await f.tick(); finish(f); await f.tick();
+  const implementation = [...f.threads.values()][0];
+  f.pr.state = "MERGED"; f.pr.headRefName = implementation.branch;
+  f.options.pullRequests.find = async (_route: unknown, branch: string) => branch === implementation.branch ? { ...f.pr } : null;
+  await f.sendGithub({ action: "closed", repository: { full_name: "test/repo" }, pull_request: { number: 42, html_url: f.pr.url, merged: true, head: { ref: implementation.branch } } }, true, "12345678-1234-4234-8234-123456789012", "pull_request");
+  await f.tick(1);
+  if (fresh) await f.send({ action: "created", organizationId: "workspace-1", agentSession: { id: "session-retro", issue: { id: "issue-1" } } });
+  else await f.send({ type: "Issue", action: "update", organizationId: "workspace-1", data: { id: "issue-1", updatedAt: "2026-10-01T10:00:00Z" }, updatedFrom: { stateId: "implement" } });
+  await f.tick(20);
+  const turn = f.commands.filter(c => c.type === "thread.turn.start").at(-1);
+  const retro = f.threads.get(turn.threadId);
+  assert.notEqual(retro.id, implementation.id);
+  assert.match(turn.message.text, /For each finding include its priority, concrete evidence/);
+  return { f, implementation, retro };
+}
+
+function completeRetro(thread: any, text: string) {
+  thread.latestTurn.state = "completed";
+  thread.session = { status: "ready", activeTurnId: null, lastError: null };
+  thread.messages.push({ id: `retro-result-${thread.latestTurn.turnId}`, role: "assistant", turnId: thread.latestTurn.turnId, text });
+}
+
+test("reused Retro publishes full findings before retiring the shared worktree and supports later questions", async t => {
+  const { f, implementation, retro } = await startMergedRetro(t, "comment");
+  assert.equal(retro.worktreePath, implementation.worktreePath);
+  const details = "Finding: provider stop evidence. Impact: protects ongoing work. Recommendation: verify before cleanup.\n".repeat(100) + "FINAL DETAILED ACTION";
+  completeRetro(retro, `${details}\n\n<bridge-result>${JSON.stringify({ status: "complete", summary: "Retro complete", validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}</bridge-result>`);
+  await f.tick(1); await accessWorkspace(retro.worktreePath);
+  await f.tick(20);
+  assert.ok(f.comments.some(comment => comment.body.includes("FINAL DETAILED ACTION")));
+  const handover = f.activities.map(activity => activity.content.body).join("\n");
+  assert.match(handover, /FINAL DETAILED ACTION/);
+  assert.doesNotMatch(handover, /<bridge-result>|"status":"complete"/);
+  await assert.rejects(accessWorkspace(retro.worktreePath));
+  assert.equal(retro.session.status, "stopped");
+  assert.equal(implementation.session.status, "stopped");
+  await f.restart(); await f.send(followup("retro-followup", "Explain the first recommendation in more detail.")); await f.tick(20);
+  const next = f.threads.get(f.commands.filter(c => c.type === "thread.turn.start").at(-1).threadId);
+  assert.notEqual(next.id, retro.id); assert.notEqual(next.worktreePath, retro.worktreePath);
+  completeRetro(next, `<bridge-result>${JSON.stringify({ status: "complete", summary: "Detailed follow-up findings", validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}</bridge-result>`);
+  await f.tick(20); await assert.rejects(accessWorkspace(next.worktreePath));
+  assert.ok(f.comments.some(comment => comment.body.includes("Detailed follow-up findings")));
+  assert.ok(f.activities.some(activity => activity.content.type === "response" && activity.content.body.includes("Detailed follow-up findings")));
+});
+
+test("fresh agent-managed Retro retains its full handover and cleanup waits for confirmed provider stop across restart", async t => {
+  const { f, implementation, retro } = await startMergedRetro(t, "agent-managed", true);
+  assert.notEqual(retro.worktreePath, implementation.worktreePath);
+  const details = "Priority: high. Evidence: PR #42 and implementation thread. Impact: discarded context. Action: retain detailed findings.\n".repeat(40) + "FINAL RETRO FINDING";
+  f.faults.deferStop = true;
+  completeRetro(retro, details); await f.tick(12);
+  await assert.rejects(accessWorkspace(implementation.worktreePath)); await accessWorkspace(retro.worktreePath);
+  assert.ok(f.activities.some(activity => activity.content.type === "response" && activity.content.body.includes("FINAL RETRO FINDING")));
+  assert.ok(!f.activities.some(activity => activity.content.body.includes("Full response is in the T3Code thread.")));
+  const stops = f.commands.filter(command => command.type === "thread.session.stop" && command.threadId === retro.id);
+  assert.equal(stops.length, 1);
+  await f.restart(); await f.tick(4);
+  assert.equal(f.commands.filter(command => command.type === "thread.session.stop" && command.threadId === retro.id).length, 1);
+  retro.session = { status: "stopped", activeTurnId: null, lastError: null };
+  await f.tick(12);
+  await assert.rejects(accessWorkspace(implementation.worktreePath)); await assert.rejects(accessWorkspace(retro.worktreePath));
+});
+
+test("post-Retro retirement retries preserved worktrees after local files are recovered", async t => {
+  const { f, retro } = await startMergedRetro(t, "comment");
+  const local = path.join(retro.worktreePath, "local-notes.txt");
+  await writeFile(local, "Keep this unpublished work");
+  completeRetro(retro, `<bridge-result>${JSON.stringify({ status: "complete", summary: "Findings and next actions", validation: [], blockers: [], context: { read: ["issue"], summarized: [], unavailable: [] } })}</bridge-result>`);
+  await f.tick(20); await f.restart(); await f.tick(4);
+  assert.equal(await readFile(local, "utf8"), "Keep this unpublished work");
+  assert.ok(f.activities.some(activity => /Post-merge cleanup: Worktree preserved: uncommitted/.test(activity.content.body)));
+  await f.send(followup("recover-notes", "Review the local notes before finalizing the retrospective.")); await f.tick(12);
+  assert.equal(f.commands.filter(command => command.type === "thread.turn.start").at(-1).threadId, retro.id);
+  await rm(local); await f.tick(4); await accessWorkspace(retro.worktreePath);
+  completeRetro(retro, `<bridge-result>${JSON.stringify({ status: "complete", summary: "Recovered the notes and refined the findings", validation: [], blockers: [], context: { read: ["issue", "local notes"], summarized: [], unavailable: [] } })}</bridge-result>`);
+  await f.tick(20); await assert.rejects(accessWorkspace(retro.worktreePath));
+  assert.equal(f.commands.filter(command => command.type === "thread.session.stop" && command.threadId === retro.id).length, 2);
+});
+
+for (const output of ["comment", "agent-managed"] as const) test(`an incomplete ${output} Retro preserves the workspace across restart`, async t => {
+  const { f, retro } = await startMergedRetro(t, output);
+  completeRetro(retro, `<bridge-result>${JSON.stringify({ status: "incomplete", summary: "Cannot inspect the required review thread", validation: [], blockers: ["Required source unavailable"], context: { read: ["issue"], summarized: [], unavailable: ["review thread"] } })}</bridge-result>`);
+  await f.tick(12); await f.restart(); await f.tick(12);
+  await accessWorkspace(retro.worktreePath);
+  assert.equal(f.comments.length, 0);
+  assert.ok(f.activities.some(activity => /Cannot inspect the required review thread/.test(activity.content.body)));
+});
+
+async function accessWorkspace(workspace: string) { await realpath(workspace); }
+
 test("external review preserves the implementation thread without starting a review turn", async t => {
   const f = await fixture(t);
   f.projectConfig.t3code.workflows[0].statuses.review = { output: "external-review", "new-thread": true, prompt: "Wait for CodeRabbit." };

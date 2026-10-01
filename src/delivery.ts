@@ -7,6 +7,7 @@ Read all supplied context and attachments. Fetch externally delegated URLs throu
 `;
 export const deliveryInstructions = `${sharedInstructions}
 Implement and test the task, commit useful changes, push this session branch, and create a draft PR with gh pr create --draft. Update the existing open PR on follow-ups. Useful incomplete changes may be delivered as a draft with explicit blockers. Never merge a PR. Never close a PR or discard changes to clean up a session. If the PR has merged or closed, stop and require a new delegation.
+Before creating or updating the PR, fetch its actual target branch (use the existing PR's baseRefName, or the repository default for a new PR). Merge the latest target branch into this session branch and resolve conflicts using the issue requirements and the intent of both changes. Do not blindly choose ours or theirs. Rerun the relevant checks after resolving conflicts, commit the resolution and push this session branch with an ordinary push; do not rewrite remote history or force-push. Check the open PR with gh pr view --json state,baseRefName,headRefOid,mergeable,mergeStateStatus after pushing. Retry an unknown mergeability result briefly; if it remains unknown, conflicts remain, required checks fail or a resolution needs an unresolved product decision, report incomplete with the specific blocker. Never claim conflicts are resolved without verification. This integrates the target into the session branch; it does not authorize merging the PR itself.
 You have full execution permissions under the dedicated service account. There is no execution or human-response deadline.
 Finish with a human-readable summary and an exact machine-readable block:
 <bridge-result>{"status":"complete","summary":"What changed","validation":[{"command":"the actual command","status":"passed","details":"observed result"}],"blockers":[],"context":{"read":[],"summarized":[],"unavailable":[]}}</bridge-result>
@@ -33,26 +34,34 @@ function bareResult(text: string): { result: z.infer<typeof ResultSchema>; start
     if (parsed.success) return { result: parsed.data, start };
   }
 }
+function readResult(text: string): z.infer<typeof ResultSchema> | undefined {
+  const block = /<bridge-result>([\s\S]*?)<\/bridge-result>/.exec(text);
+  if (!block) return bareResult(text)?.result;
+  try {
+    const parsed = ResultSchema.safeParse(JSON.parse(block[1]!));
+    if (parsed.success) return parsed.data;
+  } catch { /* Invalid reports cannot establish completion. */ }
+}
+export function agentManagedComplete(text: string): boolean {
+  const result = readResult(text);
+  return result ? result.status === "complete" && !result.blockers.length && result.validation.every(check => check.status === "passed") : !text.includes("<bridge-result>");
+}
 export function agentManagedResponse(text: string): string {
   const readable = text.replace(/<bridge-result>[\s\S]*?<\/bridge-result>/g, "").trim();
   const bare = bareResult(readable);
-  if (bare) {
-    const introduction = readable.slice(0, bare.start).trim();
-    const summary = bare.result.summary.trim();
+  const result = bare?.result ?? readResult(text);
+  if (result) {
+    const introduction = bare ? readable.slice(0, bare.start).trim() : readable;
+    const summary = result.summary.trim();
     return introduction && introduction !== summary ? `${introduction}\n\n${summary}` : summary || introduction;
   }
   return readable;
 }
-export function deliveryResult(text: string, output: Stage["output"] = "draft-pr") {
+export function deliveryResult(text: string, output: Stage["output"] = "draft-pr", detailed = false) {
   const planning = output !== "draft-pr";
-  const block = /<bridge-result>([\s\S]*?)<\/bridge-result>/.exec(text);
-  let data: unknown;
-  if (block) {
-    try { data = JSON.parse(block[1]!); } catch { /* Invalid evidence is an incomplete result. */ }
-  } else data = bareResult(text)?.result;
-  const parsed = ResultSchema.safeParse(data);
-  if (!parsed.success) return { complete: false, body: `Incomplete: T3Code did not supply a valid validation/context report.\n\n${text || "No result summary was supplied."}` };
-  const result = parsed.data;
+  const result = readResult(text);
+  if (!result) return { complete: false, body: `Incomplete: T3Code did not supply a valid validation/context report.\n\n${text || "No result summary was supplied."}` };
+  if (detailed) result.summary = agentManagedResponse(text);
   if (output === "specification" && !result.artifacts?.specification) return { complete: false, body: "Incomplete: a reviewable parent specification is required in the artifact output." };
   if (output === "tickets" && (!result.artifacts?.children || !result.artifacts.approved)) return { complete: false, body: "Incomplete: an approved breakdown of linked children with acceptance criteria and dependencies is required." };
   if (result.artifacts && ((output !== "specification" && result.artifacts.specification) || (output !== "tickets" && result.artifacts.children))) return { complete: false, body: "Incomplete: artifact output belongs to another workflow. Finish only the current human-selected stage." };
@@ -65,7 +74,8 @@ export function deliveryResult(text: string, output: Stage["output"] = "draft-pr
 export function workflowInstructions(stage: Stage): string {
   const artifactInstructions = `Linear is the authoritative artifact store for this workflow, overriding repository defaults: the parent issue description holds the current brief/specification; parent comments hold decisions, questions and revision summaries; native Linear children hold implementation scope, acceptance criteria and dependencies. Do not publish planning Markdown, GitHub tickets or duplicate full specifications. Preserve the original problem and relevant content. Refresh and read supplied issue, parent, comments, children and dependencies before acting. Missing required handoff material is a prerequisite: pause and ask rather than invent decisions.
 Never advance statuses, delegate children or approve your own stage output. Humans select the next stage. Honor reviews required by the installed skill. On re-entry revise existing artifacts by their retained identities, reconcile unstarted children, and flag impacts on active/completed children for human review without changing their commitments. Preserve existing repository files, branch and PR state across thread changes. A fresh thread does not authorize duplicate work or reopening a closed/merged PR.`;
-  const configured = `Project instructions:\n${stage.instructions ?? ""}\n\nStatus prompt:\n${stage.prompt}\n\nRequired skills verified in this workspace:\n${stage.skills.map(skill => `${skill.name}: ${skill.path}`).join("\n")}`;
+  const retrospective = stage.retrospective ? `\nRetrospective handover: return the findings in the final handover itself, not just a short completion notice or a link to another report. For each finding include its priority, concrete evidence with thread/PR/file references where available, the impact, and the recommended change with its rationale. Explain what worked well, unresolved questions and the next actions requiring a decision. Distinguish recommendations from changes actually applied, and say which sources were unavailable. Include all these details in the bridge-result summary when returning one; do not abbreviate the findings there.\n` : "";
+  const configured = `Project instructions:\n${stage.instructions ?? ""}\n\nStatus prompt:\n${stage.prompt}\n\nRequired skills verified in this workspace:\n${stage.skills.map(skill => `${skill.name}: ${skill.path}`).join("\n")}${retrospective}`;
   if (stage.output === "agent-managed") return `${sharedInstructions}\n${configured}`;
   if (stage.output === "draft-pr") return `${deliveryInstructions}\n${artifactInstructions}\n${configured}`;
   return `${sharedInstructions}\n${artifactInstructions}

@@ -5,6 +5,7 @@ import { IntegrationError } from "./t3code-runner.js";
 export type Stage = {
   id: string; output: StatusConfig["output"]; statusId: string; teamId: string;
   prompt: string; instructions?: string; skills: Array<{ name: string; path: string }>;
+  retrospective?: boolean;
 };
 export function selectStatus(issue: IssueContext, config: ResolvedProjectConfig) {
   if (!issue.state || issue.state.team.id !== issue.team.id) throw new IntegrationError("Linear status identity is unavailable or belongs to another team; restore access and resume.", false);
