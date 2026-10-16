@@ -1,5 +1,3 @@
-# Install the bridge
+# Install the Linear filter/forwarder
 
-Follow the [primary quickstart](README.md#quickstart-existing-linear-and-t3code-installations). It includes the required build, guided setup, project labels and app-actor installation.
-
-See [operations and troubleshooting](docs/operations.md) for credentials, HTTPS and service operation. Contributor tests and disposable delegation exercises are in [maintainer verification](docs/maintainer-verification.md); they are not onboarding requirements.
+Follow [README.md](README.md#requirements-and-setup), then the [cutover runbook](docs/operations.md). The former bridge's OAuth, execution and project-description YAML setup no longer apply.
