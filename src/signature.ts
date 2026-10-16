@@ -1,26 +1,9 @@
-import crypto from "node:crypto";
-import { config } from "./config.js";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
-export function verifyLinearSignature(headerSignature: string | undefined, rawBody: Buffer): boolean {
-  if (!headerSignature) return false;
-
-  let provided: Buffer;
-  try {
-    provided = Buffer.from(headerSignature, "hex");
-  } catch {
-    return false;
-  }
-
-  const computed = crypto
-    .createHmac("sha256", config.LINEAR_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest();
-
-  if (provided.length !== computed.length) return false;
-  return crypto.timingSafeEqual(provided, computed);
-}
-
-export function isFreshWebhookTimestamp(timestamp: unknown, maxSkewMs = 60_000): boolean {
-  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return false;
-  return Math.abs(Date.now() - timestamp) <= maxSkewMs;
-}
+export const sign = (secret: string, body: Buffer): string => createHmac("sha256", secret).update(body).digest("hex");
+export const verifySignature = (secret: string, body: Buffer, signature: string | undefined): boolean => {
+  if (!signature || !/^[a-f\d]{64}$/i.test(signature)) return false;
+  return timingSafeEqual(Buffer.from(sign(secret, body), "hex"), Buffer.from(signature, "hex"));
+};
+export const isFresh = (timestamp: unknown, now: number, maxAge: number): boolean =>
+  typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp <= now + 60000 && now - timestamp <= maxAge;

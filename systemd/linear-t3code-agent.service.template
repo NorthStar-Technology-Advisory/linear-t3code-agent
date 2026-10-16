@@ -1,6 +1,5 @@
 [Unit]
-Description=Linear T3Code Agent Bridge
-Documentation=file:%h/linear-t3code-agent/README.md
+Description=Linear T3 Code Webhook Filter/Forwarder
 After=network-online.target
 Wants=network-online.target
 
@@ -8,14 +7,13 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/linear-t3code-agent
 EnvironmentFile=%h/linear-t3code-agent/.env
-Environment=TOKEN_STORE_PATH=%h/linear-t3code-agent/data/linear-tokens.json
-Environment=STATE_STORE_PATH=%h/linear-t3code-agent/data/oauth-states.json
 Environment=PATH=REPLACE_WITH_SERVICE_ACCOUNT_PATH
-ExecStart=REPLACE_WITH_ABSOLUTE_NODE_PATH dist/server.js
+ExecStart=REPLACE_WITH_ABSOLUTE_NODE24_PATH dist/server.js
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=10
+UMask=0077
 
 [Install]
 WantedBy=default.target
